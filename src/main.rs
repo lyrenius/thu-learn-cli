@@ -10,6 +10,7 @@ mod mock_sso;
 mod models;
 mod paths;
 mod sso;
+mod tui;
 
 #[tokio::main]
 async fn main() {

@@ -7,7 +7,8 @@
 
 ## Module Boundaries
 
-* `src/cli.rs`: clap command surface, aliases, human vs `--json` output, login/logout prompts, cache clearing, and command orchestration.
+* `src/cli.rs`: clap command surface, aliases, human vs `--json` output, login/logout prompts, cache clearing, and command orchestration. Bare `thu-learn` starts the TUI only when stdin and stdout are terminals; otherwise it prints help.
+* `src/tui/`: interactive ratatui front end for humans. `app.rs` is state that turns keys and background results into `Effect`s (unit-testable, no network I/O); `mod.rs` runs the event loop and executes effects with the shared `Client`; `ui.rs` renders; `browser.rs` is the yazi-style submission file picker; `input.rs` holds the text field and path helpers. The TUI never logs in: it reuses the saved session and points to `thu-learn login`. The CLI stays the interface for scripts and agents, so keep its output and flags stable when changing the TUI.
 * `src/client.rs`: reqwest client, cookie store, `_csrf` extraction, authenticated GET/POST/download helpers, cookie persistence, and silent re-login (`send_authed`, `renew_session`, `sso_login`).
 * `src/api.rs`: Learn API endpoints plus JSON/HTML parsing for courses, homework, announcements, files, and submit.
 * `src/auth.rs`: remembered-login orchestration for `thu-learn login`: saved device trust first, then the browser, then an HTTP re-login check before saving credentials.
@@ -45,7 +46,9 @@
 
 ## Testing And CLI Behavior
 
-* Existing tests are inline unit tests in `src/api.rs`, `src/client.rs`, `src/sso.rs`, `src/credentials.rs`, `src/browser_login.rs`, and `src/cli.rs`; add pure parser/helper tests near the code being changed.
+* Existing tests are inline unit tests in `src/api.rs`, `src/client.rs`, `src/sso.rs`, `src/credentials.rs`, `src/browser_login.rs`, `src/cli.rs`, and `src/tui/`; add pure parser/helper tests near the code being changed.
 * HTTP auth flows are tested against `src/mock_sso.rs` on 127.0.0.1; the SM2 fixture in `src/sso.rs` was generated with sm-crypto 0.5.8, the library thu-learn-lib uses.
+* TUI tests drive `App` with key events and render `ui::draw` into ratatui's `TestBackend`; they use fixtures from `tui::app::tests`, never a live session.
+* All server text shown in the TUI goes through `cli::strip_terminal_controls` (via `ui::clean`/`ui::clean_lines`) so Learn content cannot inject terminal escape sequences.
 * Use `--json` for scriptable CLI checks when supported; human output uses colors only when stdout supports them.
 * Hidden command `thu-learn debug` prints raw JSON for field checks, but it requires a valid login session.

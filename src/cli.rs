@@ -1,7 +1,8 @@
 //! Command-line interface and subcommand orchestration.
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use crate::auth::{self, LoginOutcome};
@@ -44,7 +45,8 @@ fn sanitize_table_text(raw: &str) -> String {
     strip_terminal_controls(raw)
 }
 
-fn strip_terminal_controls(raw: &str) -> String {
+/// Removes terminal escape sequences and invisible format characters from server text.
+pub(crate) fn strip_terminal_controls(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut chars = raw.chars().peekable();
 
@@ -427,18 +429,26 @@ fn detail_section(title: &str, body: &str) -> String {
 #[command(
     name = "thu-learn",
     version,
-    about = "Tsinghua Web Learning command-line client for homework deadlines, files, announcements, and submissions"
+    about = "Tsinghua Web Learning command-line client for homework deadlines, files, announcements, and submissions",
+    after_help = "Run `thu-learn` without a command in a terminal to open the interactive TUI."
 )]
 pub struct Cli {
     /// Print JSON output for supported commands.
     #[arg(long, global = true)]
     json: bool,
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Open the interactive terminal UI (the default when run without a command in a terminal).
+    #[command(visible_alias = "ui")]
+    Tui {
+        /// Directory for downloads started from the TUI. Defaults to the current directory.
+        #[arg(short, long)]
+        dir: Option<PathBuf>,
+    },
     /// Log in once and stay logged in: expired sessions are renewed automatically.
     ///
     /// Asks for your Tsinghua username and password, then opens Chrome for captcha
@@ -537,7 +547,17 @@ enum FileCommands {
 pub async fn run() -> Result<()> {
     let cli = Cli::parse();
     let json = cli.json;
-    match cli.command {
+    let Some(command) = cli.command else {
+        // Humans get the TUI; scripts and agents without a terminal get help text.
+        if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() && !json {
+            return cmd_tui(None).await;
+        }
+        Cli::command().print_help()?;
+        println!();
+        return Ok(());
+    };
+    match command {
+        Commands::Tui { dir } => cmd_tui(dir).await,
         Commands::Login {
             username,
             no_remember,
@@ -597,6 +617,17 @@ async fn prepare() -> Result<(Client, Vec<Course>)> {
 }
 
 // ---------- Commands ----------
+
+async fn cmd_tui(dir: Option<PathBuf>) -> Result<()> {
+    if !std::io::stdout().is_terminal() {
+        anyhow::bail!("The TUI needs an interactive terminal; use the subcommands for scripts.");
+    }
+    let download_dir = match dir {
+        Some(dir) => dir,
+        None => std::env::current_dir().context("Could not read the current directory")?,
+    };
+    crate::tui::run(crate::tui::Options { download_dir }).await
+}
 
 async fn cmd_login(username: Option<String>, force_browser: bool) -> Result<()> {
     // Report a mistyped THU_LEARN_CREDENTIAL_STORE before asking for anything.
@@ -729,7 +760,7 @@ fn prompt_username(default: Option<&str>) -> Result<String> {
 }
 
 /// Returns the previous semester ID used to backfill older homework course names.
-fn prev_semester(s: &str) -> Option<String> {
+pub(crate) fn prev_semester(s: &str) -> Option<String> {
     let p: Vec<&str> = s.split('-').collect();
     if p.len() != 3 {
         return None;

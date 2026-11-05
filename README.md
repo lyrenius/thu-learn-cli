@@ -1,9 +1,15 @@
 # thu-learn-cli
 
-`thu-learn-cli` is a Rust command-line client for Tsinghua University's Web Learning (<https://learn.tsinghua.edu.cn>). It helps students inspect homework deadlines, read announcements, download course files, and submit homework from a terminal.
+`thu-learn-cli` is a Rust client for Tsinghua University's Web Learning (<https://learn.tsinghua.edu.cn>). It helps students inspect homework deadlines, read announcements, download course files, and submit homework from a terminal.
+
+It has two front ends over the same Learn client:
+
+* **TUI for humans**: run `thu-learn` with no arguments for an interactive, keyboard-driven interface.
+* **CLI for scripts and agents**: subcommands such as `thu-learn hw --json` print stable, scriptable output.
 
 ## Features
 
+* Interactive TUI with homework, announcement, file, and course tabs, live search, course filters, downloads, and submission.
 * Browser-based login through the official Tsinghua authentication flow.
 * Stays logged in: like learnX, an expired Learn session is renewed automatically in the background.
 * Homework listing, detail view, attachment download, and submission.
@@ -20,6 +26,36 @@ cargo build --release
 ```
 
 The binary is written to `target/release/thu-learn`.
+
+## TUI
+
+```bash
+thu-learn            # in a terminal; same as `thu-learn tui`
+thu-learn tui -d ~/Downloads
+```
+
+The screen shows a list on the left and details for the selected item on the right (stacked on narrow terminals). The TUI reuses the session saved by `thu-learn login`; if there is none, it asks you to run that command and press `r`.
+
+| Key | Action |
+| --- | --- |
+| `1`-`4`, `Tab`, `←`/`→` | Switch between Homework, Announcements, Files, and Courses |
+| `↑`/`↓`, `j`/`k`, `PgUp`/`PgDn`, `g`/`G` | Move the selection |
+| `Enter` | Open details full screen (in Courses: show that course's homework) |
+| `J`/`K` | Scroll details; `n`/`p` move to the next/previous item while details are open |
+| `/` | Search the current list; `Esc` clears the search, then the course filter |
+| `c` | Choose a course for every tab |
+| `f` | Homework: cycle pending, overdue, done, all. Announcements: toggle unread only |
+| `d` | Download the selected homework's attachments or the selected file |
+| `s` | Submit a file for the selected homework through the file picker (below) |
+| `D` / `o` | Change the download folder / open the last download |
+| `r` | Refresh from Learn |
+| `?` / `q` | Help / quit |
+
+Submitting opens a three-column file picker in the style of yazi or ranger: parent folder, current folder, and a preview of the selection. Use `↑`/`↓` or `j`/`k` to move, `←`/`→` or `h`/`l` to change folders, and `Enter` on a file to choose it. Then type an optional comment and press `Enter` to review; the confirmation shows the course, homework, file, and size before anything is sent, and `n` returns to the picker. In the picker, `/` filters the folder, `:` jumps to a typed path (with `Tab` completion), `.` shows hidden files, `~` goes home, and dragging a file into the terminal chooses it. The picker opens in the download folder and then remembers the last folder you submitted from.
+
+Downloads go to the current directory unless `--dir` or `D` says otherwise, and never overwrite an existing file (a ` (1)` suffix is added). Detail panes show each item's short ID so it can be passed to CLI commands.
+
+When stdout is not a terminal, `thu-learn` without a command prints help instead of starting the TUI, so scripts and agents never get stuck in an interactive screen.
 
 ## Authentication
 
@@ -57,7 +93,7 @@ Requirements and storage behavior:
 * Semester and course-list cache files are stored under `~/.cache/thu-learn-cli/`.
 * Running `thu-learn login` clears the cache after logging in.
 
-## Usage
+## CLI Usage
 
 List entries show a seven-character short ID. Use that short ID, a unique short-ID prefix, or a full server ID for detail, download, and submit commands where supported.
 

@@ -14,7 +14,7 @@ pub fn short_id(full: &str) -> String {
 }
 
 /// A course.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(dead_code)] // Reserved for future course display.
 pub struct Course {
     /// `wlkcid`: 网络课程 ID / online course ID.
@@ -99,7 +99,7 @@ pub struct Notification {
 }
 
 /// A file attached to a homework page.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct HomeworkAttachment {
     /// Attachment section, normalized from Learn's Chinese section labels.
     pub section: String,
@@ -110,7 +110,7 @@ pub struct HomeworkAttachment {
 }
 
 /// A course file.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[allow(dead_code)] // Reserved for grouped display.
 pub struct CourseFile {
     /// `wjid`: 文件 ID / file ID used for downloads.
