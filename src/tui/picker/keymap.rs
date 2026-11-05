@@ -516,6 +516,75 @@ pub fn help_entries(query: &str) -> Vec<&'static Binding> {
     out
 }
 
+/// One row of a help popup.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HelpItem {
+    pub keys: String,
+    pub desc: &'static str,
+    /// Run by Enter in the file-list help; spot help rows only describe keys.
+    pub action: Option<Action>,
+}
+
+/// Keys of the spot popup, from yazi's `[spot]` keymap.
+const SPOT_HELP: &[(&str, &str)] = &[
+    ("<Esc>", "Close the spot"),
+    ("<C-[>", "Close the spot"),
+    ("<C-c>", "Close the spot"),
+    ("<Tab>", "Close the spot"),
+    ("k", "Previous line"),
+    ("j", "Next line"),
+    ("h", "Swipe to previous file"),
+    ("l", "Swipe to next file"),
+    ("<Up>", "Previous line"),
+    ("<Down>", "Next line"),
+    ("<Left>", "Swipe to previous file"),
+    ("<Right>", "Swipe to next file"),
+    ("cc", "Copy selected cell"),
+    ("~", "Open help"),
+    ("<F1>", "Open help"),
+];
+
+/// Help rows for the file list or the spot popup, filtered like [`help_entries`].
+pub fn help_items(spot: bool, query: &str) -> Vec<HelpItem> {
+    if !spot {
+        return help_entries(query)
+            .into_iter()
+            .map(|b| HelpItem {
+                keys: chord_label(b.on),
+                desc: b.desc,
+                action: Some(b.action),
+            })
+            .collect();
+    }
+    let all: Vec<HelpItem> = SPOT_HELP
+        .iter()
+        .map(|(k, d)| HelpItem {
+            keys: (*k).to_string(),
+            desc: d,
+            action: None,
+        })
+        .collect();
+    if query.is_empty() {
+        return all;
+    }
+    let q = query.to_lowercase();
+    let buckets: [&dyn Fn(&HelpItem) -> bool; 4] = [
+        &|h| h.keys.starts_with(query),
+        &|h| h.keys.to_lowercase().starts_with(&q),
+        &|h| h.keys.to_lowercase().contains(&q),
+        &|h| h.desc.to_lowercase().contains(&q),
+    ];
+    let mut out: Vec<HelpItem> = Vec::new();
+    for bucket in buckets {
+        for h in &all {
+            if bucket(h) && !out.contains(h) {
+                out.push(h.clone());
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

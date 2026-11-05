@@ -16,7 +16,7 @@ use chrono::{DateTime, Local};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::input::{complete_path, expand_path, normalize_pasted_path, Input};
-use super::picker::{Outcome, Picker};
+use super::picker::{CursorShape, Outcome, Picker};
 use crate::models::{
     Course, CourseFile, Homework, HomeworkAttachment, HomeworkStatus, Notification,
 };
@@ -357,6 +357,14 @@ impl App {
             now,
             spinner: 0,
             should_quit: false,
+        }
+    }
+
+    /// Cursor shape for the picker's inputs; `None` keeps the terminal default.
+    pub fn cursor_shape(&self) -> Option<CursorShape> {
+        match &self.overlay {
+            Some(Overlay::Submit(submit)) => submit.picker.cursor_shape(),
+            _ => None,
         }
     }
 
@@ -1151,18 +1159,29 @@ impl App {
 
     /// Shows the confirmation for a file chosen in the picker; declining it
     /// returns to the picker as it was.
-    fn review_submission(&mut self, submit: Box<SubmitState>, file: PathBuf, comment: String) {
+    fn review_submission(&mut self, mut submit: Box<SubmitState>, file: PathBuf, comment: String) {
+        // The file may have changed since the folder was listed.
+        let size = match std::fs::metadata(&file) {
+            Ok(m) if m.is_file() => m.len(),
+            _ => {
+                submit.picker.warn(
+                    "Submit",
+                    format!("{} is no longer a regular file.", file.display()),
+                );
+                self.overlay = Some(Overlay::Submit(submit));
+                return;
+            }
+        };
         self.submit_dir = submit.picker.cwd.clone();
-        let size = std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
-        let mut lines = vec![
-            format!("{} | {}", submit.course, submit.title),
-            format!("File: {} ({})", file.display(), human_size(size)),
-        ];
+        // Warnings first, so a short terminal never hides them.
+        let mut lines = Vec::new();
+        if submit.already_submitted {
+            lines.push("This homework already has a submission.".to_string());
+        }
+        lines.push(format!("{} | {}", submit.course, submit.title));
+        lines.push(format!("File: {} ({})", file.display(), human_size(size)));
         if !comment.is_empty() {
             lines.push(format!("Comment: {comment}"));
-        }
-        if submit.already_submitted {
-            lines.push("This homework already has a submission.".into());
         }
         self.overlay = Some(Overlay::Confirm {
             title: "Submit homework?".into(),

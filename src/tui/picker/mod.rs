@@ -81,6 +81,12 @@ pub struct Folder {
     /// Name of the entry last hovered, followed across re-sorts and reloads.
     trace: Option<OsString>,
     pub error: Option<String>,
+    /// Directory modification time when listed, to notice changes.
+    mtime: Option<std::time::SystemTime>,
+}
+
+fn dir_mtime(path: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
 impl Folder {
@@ -258,6 +264,8 @@ pub enum Popup {
     Help {
         editor: Editor,
         scroll: Scroll,
+        /// Set when the help belongs to the spot popup; closing returns to it.
+        spot: Option<SpotState>,
     },
     Spot {
         row: usize,
@@ -315,6 +323,26 @@ pub struct Picker {
     history: Vec<String>,
     /// Visible entry counts of directories listed so far, for the size linemode.
     pub counts: HashMap<PathBuf, usize>,
+    /// Rows of the help list, set by the view.
+    pub help_limit: usize,
+    /// Text shared by input yank/cut/paste and the copy keys.
+    clipboard: String,
+    last_refresh: Instant,
+}
+
+/// Terminal cursor shape for the active input: a bar in insert mode and a
+/// block in normal mode, as yazi shows them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorShape {
+    Bar,
+    Block,
+}
+
+/// The spot popup's state, kept while its help is open.
+#[derive(Debug, Clone)]
+pub struct SpotState {
+    pub row: usize,
+    pub size: Option<Arc<SizeJob>>,
 }
 
 fn absolute(path: &Path) -> PathBuf {
@@ -351,6 +379,7 @@ impl Picker {
                 scroll: Scroll::default(),
                 trace: None,
                 error: None,
+                mtime: None,
             },
             back: Backstack::new(start.clone()),
             cwd: start.clone(),
@@ -371,6 +400,9 @@ impl Picker {
             notices: Vec::new(),
             history: Vec::new(),
             counts: HashMap::new(),
+            help_limit: HELP_ROWS,
+            clipboard: String::new(),
+            last_refresh: Instant::now(),
         };
         picker.current = picker.load(&start);
         picker.parent = picker.load_parent();
@@ -394,6 +426,7 @@ impl Picker {
             scroll: memo.as_ref().map(|m| m.scroll).unwrap_or_default(),
             trace: memo.and_then(|m| m.trace),
             error,
+            mtime: dir_mtime(path),
         };
         folder.rebuild(self.show_hidden);
         folder.repos(self.limit);
@@ -481,7 +514,70 @@ impl Picker {
             folder.repos(limit);
         }
         self.seed = seed;
+        self.rehover_parent();
         self.preview = None;
+    }
+
+    /// The parent column always tracks the current directory, as in yazi.
+    fn rehover_parent(&mut self) {
+        let name = self.cwd.file_name().map(|n| n.to_os_string());
+        if let (Some(parent), Some(name)) = (self.parent.as_mut(), name) {
+            parent.hover(&name, self.limit);
+        }
+    }
+
+    /// Re-lists a folder in place, keeping its filter, cursor, and trace.
+    fn relist(&mut self, folder: &mut Folder) {
+        let (mut all, error) = match fs::list_dir(&folder.path) {
+            Ok(all) => (all, None),
+            Err(e) => (Vec::new(), Some(e)),
+        };
+        self.sorter.sort(&mut all, &mut self.seed);
+        folder.all = all;
+        folder.error = error;
+        folder.mtime = dir_mtime(&folder.path);
+        folder.rebuild(self.show_hidden);
+        folder.repos(self.limit);
+        if folder.error.is_none() {
+            self.counts.insert(folder.path.clone(), folder.items.len());
+        }
+    }
+
+    /// Picks up files created, removed, or changed since the folders were listed.
+    fn refresh_changed(&mut self) {
+        let hovered_changed = self.hovered().is_some_and(|e| {
+            Entry::from_path(&e.path).is_none_or(|now| now.len != e.len || now.mtime != e.mtime)
+        });
+        if hovered_changed || dir_mtime(&self.current.path) != self.current.mtime {
+            let mut current = std::mem::replace(
+                &mut self.current,
+                Folder {
+                    path: PathBuf::new(),
+                    all: Vec::new(),
+                    items: Vec::new(),
+                    filter: None,
+                    scroll: Scroll::default(),
+                    trace: None,
+                    error: None,
+                    mtime: None,
+                },
+            );
+            self.relist(&mut current);
+            self.current = current;
+            self.preview = None;
+        }
+        if let Some(mut parent) = self.parent.take() {
+            if dir_mtime(&parent.path) != parent.mtime {
+                self.relist(&mut parent);
+            }
+            self.parent = Some(parent);
+            self.rehover_parent();
+        }
+        if let Some(PreviewContent::Dir(folder)) = self.preview.as_ref().map(|p| &p.content) {
+            if dir_mtime(&folder.path) != folder.mtime {
+                self.preview = None;
+            }
+        }
     }
 
     /// Called by the view with the current layout.
@@ -539,7 +635,7 @@ impl Picker {
         let Some(p) = self.preview.as_mut() else {
             return;
         };
-        let raw = units as isize * h as isize / 10;
+        let raw = (units as isize * h as isize).div_euclid(10);
         match &p.content {
             PreviewContent::File(Preview::Text(lines)) => {
                 let step = if raw == 0 {
@@ -603,10 +699,13 @@ impl Picker {
         if self.current.filter.as_ref().map(|f| &f.raw) == filter.as_ref().map(|f| &f.raw) {
             return true;
         }
-        self.current.retrace();
+        let old = self.current.hovered().map(|e| e.os_name.clone());
         self.current.filter = filter;
         self.current.rebuild(self.show_hidden);
-        self.current.repos(self.limit);
+        match old {
+            Some(name) => self.current.hover(&name, self.limit),
+            None => self.current.repos(self.limit),
+        }
         true
     }
 
@@ -684,17 +783,62 @@ impl Picker {
     pub fn tick(&mut self, now: Instant) {
         self.notices
             .retain(|n| now.duration_since(n.at) < NOTICE_TTL);
+        if now.duration_since(self.last_refresh) >= Duration::from_secs(1) {
+            self.last_refresh = now;
+            self.refresh_changed();
+        }
+    }
+
+    /// A warning notice, for the app to report problems found after choosing.
+    pub fn warn(&mut self, title: &str, message: impl Into<String>) {
+        self.notify(title, message, Level::Warn);
+    }
+
+    pub fn cursor_shape(&self) -> Option<CursorShape> {
+        let editor = match &self.popup {
+            Some(Popup::Input { editor, .. }) | Some(Popup::Help { editor, .. }) => editor,
+            _ => return None,
+        };
+        Some(match editor.mode {
+            Mode::Insert => CursorShape::Bar,
+            Mode::Normal => CursorShape::Block,
+        })
+    }
+
+    fn editor(&self, value: &str) -> Editor {
+        let mut editor = Editor::new(value);
+        editor.register = self.clipboard.clone();
+        editor
+    }
+
+    /// Takes yanked or cut input text into the shared clipboard.
+    fn sync_register(&mut self, editor: &Editor) -> Option<String> {
+        (editor.register != self.clipboard).then(|| {
+            self.clipboard = editor.register.clone();
+            self.clipboard.clone()
+        })
     }
 
     // ---------- Keys ----------
 
     pub fn on_paste(&mut self, text: &str) {
+        self.pending.clear();
         match &mut self.popup {
             Some(Popup::Input { editor, .. }) => {
                 editor.insert_str(text);
                 self.after_edit();
             }
-            Some(Popup::Help { editor, .. }) => editor.insert_str(text),
+            Some(Popup::Help {
+                editor,
+                scroll,
+                spot,
+            }) => {
+                editor.insert_str(text);
+                let total = keymap::help_items(spot.is_some(), &editor.value()).len();
+                let rows = self.help_limit;
+                scroll.cursor = scroll.cursor.min(total.saturating_sub(1));
+                scroll.arrow(Step::Offset(0), total, rows, rows / 2);
+            }
             Some(Popup::Spot { .. }) => {}
             None => {
                 // A dragged-in file is revealed and chosen.
@@ -724,7 +868,11 @@ impl Picker {
                 cmp,
                 invalid,
             }) => self.on_input_key(kind, editor, cmp, invalid, key),
-            Some(Popup::Help { editor, scroll }) => self.on_help_key(editor, scroll, key),
+            Some(Popup::Help {
+                editor,
+                scroll,
+                spot,
+            }) => self.on_help_key(editor, scroll, spot, key),
             Some(Popup::Spot {
                 row,
                 size,
@@ -781,12 +929,14 @@ impl Picker {
             Action::SelectAll | Action::InvertSelection => {
                 let paths: Vec<PathBuf> =
                     self.current.items.iter().map(|e| e.path.clone()).collect();
+                let (on, off): (Vec<PathBuf>, Vec<PathBuf>) =
+                    paths.into_iter().partition(|p| self.selected.contains(p));
+                if action == Action::InvertSelection {
+                    // Remove in one pass so the rest keeps its selection order.
+                    self.selected.retain(|p| !on.contains(p));
+                }
                 let mut conflict = false;
-                for path in paths {
-                    let selected = self.selected.contains(&path);
-                    if action == Action::SelectAll && selected {
-                        continue;
-                    }
+                for path in off {
                     conflict |= !self.toggle(&path);
                 }
                 if conflict {
@@ -799,10 +949,10 @@ impl Picker {
             }
             Action::Seek(units) => self.seek(units),
             Action::Spot => {
-                if let Some(e) = self.hovered().cloned() {
+                if self.hovered().is_some() {
                     self.popup = Some(Popup::Spot {
                         row: 1,
-                        size: self.spawn_size(&e),
+                        size: self.spawn_size(),
                         pending_c: false,
                     });
                 }
@@ -815,6 +965,7 @@ impl Picker {
             Action::Linemode(m) => self.linemode = m,
             Action::Copy(what) => {
                 let text = self.copy_text(what);
+                self.clipboard = text.clone();
                 self.notify("Copy", "Copied to the clipboard.", Level::Info);
                 return Outcome::Copy(text);
             }
@@ -865,8 +1016,9 @@ impl Picker {
             }
             Action::Help => {
                 self.popup = Some(Popup::Help {
-                    editor: Editor::new(""),
+                    editor: self.editor(""),
                     scroll: Scroll::default(),
+                    spot: None,
                 });
             }
             Action::Unavailable => self.notify(
@@ -882,7 +1034,7 @@ impl Picker {
         self.popup = Some(Popup::Input {
             cmp: (kind == InputKind::Cd).then(Cmp::default),
             kind,
-            editor: Editor::new(""),
+            editor: self.editor(""),
             invalid: false,
         });
     }
@@ -1045,6 +1197,22 @@ impl Picker {
         }
 
         let edit = editor.handle_key(key, &self.history);
+        let copied = self.sync_register(&editor);
+        let outcome = self.after_input_key(kind, editor, cmp, invalid, edit);
+        match (outcome, copied) {
+            (Outcome::Continue, Some(text)) => Outcome::Copy(text),
+            (outcome, _) => outcome,
+        }
+    }
+
+    fn after_input_key(
+        &mut self,
+        kind: InputKind,
+        editor: Editor,
+        mut cmp: Option<Cmp>,
+        invalid: bool,
+        edit: Edit,
+    ) -> Outcome {
         match edit {
             Edit::Submit(value) => {
                 editor::remember(&mut self.history, &value);
@@ -1062,9 +1230,12 @@ impl Picker {
                 Outcome::Continue
             }
             Edit::Moved | Edit::None => {
-                if editor.mode == Mode::Normal {
-                    if let Some(c) = cmp.as_mut() {
+                if let Some(c) = cmp.as_mut().filter(|c| !c.items.is_empty()) {
+                    if editor.mode == Mode::Normal {
                         c.items.clear();
+                    } else {
+                        // Moving the cursor re-triggers completion while it is shown.
+                        refresh_cmp(c, &editor.completion_word(), &self.cwd);
                     }
                 }
                 self.popup = Some(Popup::Input {
@@ -1106,11 +1277,27 @@ impl Picker {
 
     // ---------- Help ----------
 
-    fn on_help_key(&mut self, mut editor: Editor, mut scroll: Scroll, key: KeyEvent) -> Outcome {
+    fn on_help_key(
+        &mut self,
+        mut editor: Editor,
+        mut scroll: Scroll,
+        spot: Option<SpotState>,
+        key: KeyEvent,
+    ) -> Outcome {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let entries = keymap::help_entries(&editor.value());
+        let for_spot = spot.is_some();
+        let entries = keymap::help_items(for_spot, &editor.value());
         let total = entries.len();
-        let rows = HELP_ROWS;
+        let rows = self.help_limit.max(1);
+        let back = |p: &mut Self, spot: Option<SpotState>| {
+            if let Some(s) = spot {
+                p.popup = Some(Popup::Spot {
+                    row: s.row,
+                    size: s.size,
+                    pending_c: false,
+                });
+            }
+        };
         let step = match key.code {
             KeyCode::Up => Some(Step::Prev),
             KeyCode::Down => Some(Step::Next),
@@ -1122,39 +1309,70 @@ impl Picker {
         };
         if let Some(step) = step {
             scroll.arrow(step, total, rows, rows / 2);
-            self.popup = Some(Popup::Help { editor, scroll });
+            self.popup = Some(Popup::Help {
+                editor,
+                scroll,
+                spot,
+            });
             return Outcome::Continue;
         }
         if key.code == KeyCode::Enter {
-            return match entries.get(scroll.cursor) {
-                Some(b) => self.run(b.action, b.desc),
-                None => Outcome::Continue,
+            let action = entries.get(scroll.cursor).and_then(|h| h.action);
+            back(self, spot);
+            return match (action, entries.get(scroll.cursor)) {
+                (Some(action), Some(h)) => self.run(action, h.desc),
+                _ => Outcome::Continue,
             };
         }
-        match editor.handle_key(key, &[]) {
-            Edit::Cancel | Edit::Submit(_) => {}
+        let edit = editor.handle_key(key, &[]);
+        let copied = self.sync_register(&editor);
+        match edit {
+            Edit::Cancel | Edit::Submit(_) => back(self, spot),
             Edit::Changed => {
-                let total = keymap::help_entries(&editor.value()).len();
+                let total = keymap::help_items(for_spot, &editor.value()).len();
                 scroll.cursor = scroll.cursor.min(total.saturating_sub(1));
                 scroll.arrow(Step::Offset(0), total, rows, rows / 2);
-                self.popup = Some(Popup::Help { editor, scroll });
+                self.popup = Some(Popup::Help {
+                    editor,
+                    scroll,
+                    spot,
+                });
             }
-            Edit::Moved | Edit::None => self.popup = Some(Popup::Help { editor, scroll }),
+            Edit::Moved | Edit::None => {
+                self.popup = Some(Popup::Help {
+                    editor,
+                    scroll,
+                    spot,
+                })
+            }
         }
-        Outcome::Continue
+        copied.map_or(Outcome::Continue, Outcome::Copy)
     }
 
     // ---------- Spot ----------
 
-    fn spawn_size(&self, e: &Entry) -> Option<Arc<SizeJob>> {
-        if !e.is_dir() {
-            return None;
-        }
+    /// Starts a recursive size count for the selection, or for a hovered
+    /// directory. Symlinks count their own length and are not followed.
+    fn spawn_size(&self) -> Option<Arc<SizeJob>> {
+        let roots: Vec<PathBuf> = if self.selected.is_empty() {
+            let e = self.hovered().filter(|e| e.is_dir() && !e.is_link)?;
+            vec![e.path.clone()]
+        } else {
+            self.selected.clone()
+        };
         let job = Arc::new(SizeJob::default());
         let worker = job.clone();
-        let root = e.path.clone();
         std::thread::spawn(move || {
-            let mut queue = vec![root];
+            let mut queue = Vec::new();
+            for root in roots {
+                match std::fs::symlink_metadata(&root) {
+                    Ok(m) if m.is_dir() => queue.push(root),
+                    Ok(m) => {
+                        worker.bytes.fetch_add(m.len(), Ordering::Relaxed);
+                    }
+                    Err(_) => {}
+                }
+            }
             while let Some(dir) = queue.pop() {
                 if worker.cancel.load(Ordering::Relaxed) {
                     return;
@@ -1183,16 +1401,22 @@ impl Picker {
         let Some(e) = self.hovered() else {
             return Vec::new();
         };
+        let size_text = |job: &SizeJob| {
+            let bytes = fs::readable_size(job.bytes.load(Ordering::Relaxed));
+            if job.done.load(Ordering::Relaxed) {
+                bytes
+            } else {
+                format!("{bytes} (?)")
+            }
+        };
         let mut rows = Vec::new();
-        if self.selected.len() > 1 {
-            let total: u64 = self
-                .selected
-                .iter()
-                .filter_map(|p| std::fs::metadata(p).ok())
-                .map(|m| m.len())
-                .sum();
+        // Any selection shows yazi's multi spotter.
+        if !self.selected.is_empty() {
             rows.push(("Multi".to_string(), None));
-            rows.push(("  Size:".into(), Some(fs::readable_size(total))));
+            rows.push((
+                "  Size:".into(),
+                Some(size.map(size_text).unwrap_or_default()),
+            ));
             rows.push((
                 "  Count:".into(),
                 Some(format!("{} selected", self.selected.len())),
@@ -1200,14 +1424,8 @@ impl Picker {
             return rows;
         }
         if let Some(job) = size {
-            let bytes = fs::readable_size(job.bytes.load(Ordering::Relaxed));
-            let value = if job.done.load(Ordering::Relaxed) {
-                bytes
-            } else {
-                format!("{bytes} (?)")
-            };
             rows.push(("Folder".into(), None));
-            rows.push(("  Size:".into(), Some(value)));
+            rows.push(("  Size:".into(), Some(size_text(job))));
             rows.push((String::new(), None));
         }
         rows.push(("Base".into(), None));
@@ -1241,7 +1459,8 @@ impl Picker {
             }
         };
         if pending_c {
-            if key.code == KeyCode::Char('c') {
+            if key.code == KeyCode::Char('c') && !ctrl && !key.modifiers.contains(KeyModifiers::ALT)
+            {
                 let rows = self.spot_rows(size.as_deref());
                 let text = rows
                     .get(row)
@@ -1285,7 +1504,7 @@ impl Picker {
                     Step::Next
                 };
                 self.arrow(step);
-                let size = self.hovered().cloned().and_then(|e| self.spawn_size(&e));
+                let size = self.spawn_size();
                 self.popup = Some(Popup::Spot {
                     row: 1,
                     size,
@@ -1298,6 +1517,14 @@ impl Picker {
                     row,
                     size,
                     pending_c: true,
+                });
+                return Outcome::Continue;
+            }
+            KeyCode::Char('~') | KeyCode::F(1) => {
+                self.popup = Some(Popup::Help {
+                    editor: self.editor(""),
+                    scroll: Scroll::default(),
+                    spot: Some(SpotState { row, size }),
                 });
                 return Outcome::Continue;
             }
@@ -1323,14 +1550,19 @@ fn refresh_cmp(cmp: &mut Cmp, word: &str, cwd: &Path) {
         cmp.items.clear();
         return;
     }
-    let (dir_part, partial) = match word.rfind('/') {
-        Some(i) => (&word[..=i], &word[i + 1..]),
-        None => ("", word),
+    let (mut dir_part, mut partial) = match word.rfind('/') {
+        Some(i) => (word[..=i].to_string(), &word[i + 1..]),
+        None => (String::new(), word),
     };
+    // A final `.` or `..` is the directory to list, as in yazi's completer.
+    if partial == "." || partial == ".." {
+        dir_part = format!("{word}/");
+        partial = "";
+    }
     let dir = if dir_part.is_empty() {
         cwd.to_path_buf()
     } else {
-        fs::expand(dir_part, cwd)
+        fs::expand(&dir_part, cwd)
     };
     let names = cmp.cache.entry(dir.clone()).or_insert_with(|| {
         let mut names: Vec<(String, bool)> = std::fs::read_dir(&dir)
@@ -1364,7 +1596,7 @@ fn refresh_cmp(cmp: &mut Cmp, word: &str, cwd: &Path) {
         !is_prefix && n.contains(partial)
     });
     cmp.items = prefix.chain(substring).take(CMP_MAX).cloned().collect();
-    cmp.prefix = dir_part.to_string();
+    cmp.prefix = dir_part;
     cmp.scroll = Scroll::default();
 }
 

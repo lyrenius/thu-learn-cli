@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
     DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyEventKind,
 };
@@ -55,7 +56,12 @@ pub async fn run(options: Options) -> Result<()> {
     let mut terminal = ratatui::try_init().context("Failed to initialize the terminal")?;
     crossterm::execute!(std::io::stdout(), EnableBracketedPaste).ok();
     let result = event_loop(&mut terminal, options).await;
-    crossterm::execute!(std::io::stdout(), DisableBracketedPaste).ok();
+    crossterm::execute!(
+        std::io::stdout(),
+        DisableBracketedPaste,
+        SetCursorStyle::DefaultUserShape
+    )
+    .ok();
     ratatui::restore();
     result
 }
@@ -69,8 +75,18 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal, options: Options) -
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     runtime.dispatch(app.init());
+    let mut shape = None;
     loop {
         terminal.draw(|f| ui::draw(f, &mut app))?;
+        if app.cursor_shape() != shape {
+            shape = app.cursor_shape();
+            let style = match shape {
+                Some(picker::CursorShape::Bar) => SetCursorStyle::SteadyBar,
+                Some(picker::CursorShape::Block) => SetCursorStyle::SteadyBlock,
+                None => SetCursorStyle::DefaultUserShape,
+            };
+            crossterm::execute!(std::io::stdout(), style).ok();
+        }
         if app.should_quit {
             break;
         }
@@ -229,7 +245,10 @@ impl Runtime {
                 });
             }
             Effect::Copy(text) => {
-                tokio::task::spawn_blocking(move || copy_to_clipboard(&text));
+                // The escape is written here, between frames on the UI thread,
+                // so it cannot interleave with ratatui's output.
+                write_osc52(&text);
+                std::thread::spawn(move || copy_with_tools(&text));
             }
             Effect::OpenPath(path) => {
                 if let Err(e) = open_path(&path) {
@@ -388,14 +407,20 @@ fn open_path(path: &Path) -> Result<(), String> {
         .map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// Copies text like yazi: an OSC 52 escape for the terminal (works over SSH),
-/// then the first desktop clipboard tool that succeeds.
-fn copy_to_clipboard(text: &str) {
+/// Copies like yazi, first with an OSC 52 escape for the terminal (this also
+/// works over SSH).
+fn write_osc52(text: &str) {
     use std::io::Write;
     let osc = format!("\x1b]52;c;{}\x1b\\", base64(text.as_bytes()));
     let mut out = std::io::stdout();
     out.write_all(osc.as_bytes()).ok();
     out.flush().ok();
+}
+
+/// Then with the first desktop clipboard tool that succeeds. A tool that has
+/// not exited after two seconds is killed, so it cannot hang the app on exit.
+fn copy_with_tools(text: &str) {
+    use std::io::Write;
     let tools: [(&str, &[&str]); 5] = [
         ("pbcopy", &[]),
         ("termux-clipboard-set", &[]),
@@ -416,7 +441,21 @@ fn copy_to_clipboard(text: &str) {
         if let Some(mut stdin) = child.stdin.take() {
             stdin.write_all(text.as_bytes()).ok();
         }
-        if child.wait().is_ok_and(|s| s.success()) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20))
+                }
+                _ => {
+                    child.kill().ok();
+                    child.wait().ok();
+                    break None;
+                }
+            }
+        };
+        if status.is_some_and(|s| s.success()) {
             return;
         }
     }

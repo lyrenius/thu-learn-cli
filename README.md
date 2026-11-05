@@ -75,9 +75,9 @@ Submitting opens a file picker that looks and behaves like [yazi](https://github
 | `Tab` | File details (spot) |
 | `q`, `C-c` | Cancel the submission |
 
-Input popups work like yazi's: they open in insert mode, `Esc` switches to a vi-style normal mode, and a second `Esc` closes them. After choosing a file, type an optional comment and press `Enter`; the confirmation shows the course, homework, file, and size before anything is sent, and `n` returns to the picker as you left it. Dragging a file into the terminal chooses it.
+Input popups work like yazi's: they open in insert mode, `Esc` switches to a vi-style normal mode, and a second `Esc` closes them. Yanked or cut text goes to the system clipboard, and `p`/`P` paste text yanked, cut, or copied inside the picker (they do not read the system clipboard). After choosing a file, type an optional comment and press `Enter`; the confirmation shows the course, homework, file, and size before anything is sent, and `n` returns to the picker as you left it. Dragging a file into the terminal chooses it.
 
-Differences from yazi, because the picker uploads exactly one file: `Enter` on a folder enters it instead of choosing it, choosing more than one file is refused, and keys that change files, run shell commands, use tabs, or call plugins (fd, rg, fzf, zoxide) show a notice instead. The picker opens in the download folder and then remembers the last folder you submitted from.
+Differences from yazi, because the picker uploads exactly one file: `Enter` on a folder enters it instead of choosing it, choosing more than one file is refused, and keys that change files, run shell commands, use tabs, or call plugins (fd, rg, fzf, zoxide) show a notice instead. Folder listings refresh about once a second while the picker is open. The picker opens in the download folder and then remembers the last folder you submitted from.
 
 Downloads go to the current directory unless `--dir` or `D` says otherwise, and never overwrite an existing file (a ` (1)` suffix is added). Detail panes show each item's short ID so it can be passed to CLI commands.
 

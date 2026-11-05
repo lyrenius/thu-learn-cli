@@ -8,7 +8,7 @@ use ratatui::widgets::{Block, BorderType, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use super::editor::{Editor, Mode};
+use super::editor::Editor;
 use super::fs::{self, Category, Entry, Preview};
 use super::keymap::{self, Linemode};
 use super::{Cmp, Folder, Level, Matcher, Picker, Popup, PreviewContent, CMP_ROWS, HELP_ROWS};
@@ -141,16 +141,31 @@ fn entity_line(e: &Entry, w: usize, row: Row) -> Line<'static> {
     } else {
         format!(" {} ", row.linemode)
     };
-    // The name comes first: drop the find tag and link target when they would
-    // squeeze it below a few cells.
+    // Like yazi, the whole line is cut at the end: the name stays whole and
+    // the find tag or link target is shortened, unless the name itself does
+    // not fit, in which case it gets the `….ext` ellipsis and no tail.
     let room = w.saturating_sub(1 + width(&right));
-    let mut tail_w: usize = tail.iter().map(|s| width(&s.content)).sum();
-    if tail_w > 0 && room.saturating_sub(tail_w) < width(&name).min(8) {
+    let (shown, truncated) = if width(&name) >= room {
         tail.clear();
-        tail_w = 0;
+        fit_name(e, &name, room)
+    } else {
+        (name.clone(), false)
+    };
+    let mut left = room.saturating_sub(width(&shown));
+    let mut fitted = Vec::new();
+    for span in tail {
+        let sw = width(&span.content);
+        if sw <= left {
+            left -= sw;
+            fitted.push(span);
+        } else {
+            if left > 0 {
+                fitted.push(Span::styled(fit(&span.content, left), span.style));
+            }
+            break;
+        }
     }
-    let avail = room.saturating_sub(tail_w);
-    let (shown, truncated) = fit_name(e, &name, avail);
+    let tail = fitted;
 
     let mut spans = vec![Span::raw(" ")];
     // Highlight the first find match, as far as it is still visible.
@@ -283,24 +298,40 @@ pub fn draw(f: &mut Frame, area: Rect, p: &mut Picker, ctx: &Context) {
             cmp,
             invalid,
         }) => draw_input(f, area, kind.title(), editor, cmp.as_ref(), *invalid),
-        Some(Popup::Help { editor, scroll }) => {
-            draw_help(f, area, editor, scroll.cursor, scroll.offset)
+        Some(Popup::Help {
+            editor,
+            scroll,
+            spot,
+        }) => {
+            if let Some(s) = spot {
+                let rows = p.spot_rows(s.size.as_deref());
+                draw_spot(f, area, &rows, s.row, false);
+            }
+            let items = keymap::help_items(spot.is_some(), &editor.value());
+            let rows = help_rect(area).height.saturating_sub(4) as usize;
+            p.help_limit = rows.max(1);
+            // Keep the cursor visible for the height actually drawn.
+            scroll.arrow(
+                super::scroll::Step::Offset(0),
+                items.len(),
+                p.help_limit,
+                p.help_limit / 2,
+            );
+            draw_help(f, area, editor, &items, scroll.cursor, scroll.offset);
         }
-        Some(Popup::Spot { row, size, .. }) => {
+        Some(Popup::Spot {
+            row,
+            size,
+            pending_c,
+        }) => {
             let rows = p.spot_rows(size.as_deref());
-            draw_spot(f, area, &rows, *row);
+            draw_spot(f, area, &rows, *row, *pending_c);
         }
         None => {}
     }
     p.popup = popup;
-    draw_notices(
-        f,
-        Rect {
-            y: area.y + 1,
-            ..area
-        },
-        p,
-    );
+    // Notices stay between the header and the status bar.
+    draw_notices(f, main, p);
 }
 
 fn draw_banner(f: &mut Frame, area: Rect, ctx: &Context) {
@@ -451,16 +482,11 @@ fn draw_marker(f: &mut Frame, x: u16, y: u16) {
     );
 }
 
+/// yazi draws empty-folder messages centred on the pane's first row.
 fn draw_centered(f: &mut Frame, area: Rect, text: &str) {
-    let y = area.y + area.height / 2;
     f.render_widget(
         Paragraph::new(Line::from(text.to_string()).centered()).wrap(Wrap { trim: true }),
-        Rect::new(
-            area.x,
-            y.min(area.y + area.height.saturating_sub(1)),
-            area.width,
-            area.height.saturating_sub(area.height / 2),
-        ),
+        area,
     );
 }
 
@@ -668,32 +694,16 @@ fn input_rect(area: Rect) -> Rect {
     }
 }
 
+/// Draws the editor's visible text and places the terminal cursor; the
+/// runtime switches its shape between a bar (insert) and a block (normal).
 fn draw_editor_line(f: &mut Frame, area: Rect, editor: &mut Editor) {
-    let (visible, cursor_x) = editor.view(area.width.saturating_sub(1) as usize);
-    f.render_widget(Paragraph::new(visible.clone()), area);
-    let x = area.x + cursor_x as u16;
-    match editor.mode {
-        Mode::Insert => f.set_cursor_position((x, area.y)),
-        Mode::Normal => {
-            let under: String = visible
-                .chars()
-                .scan(0usize, |w, c| {
-                    let start = *w;
-                    *w += c.width().unwrap_or(0);
-                    Some((start, c))
-                })
-                .find(|(start, _)| *start == cursor_x)
-                .map(|(_, c)| c.to_string())
-                .unwrap_or_else(|| " ".into());
-            f.render_widget(
-                Paragraph::new(Span::styled(
-                    under,
-                    Style::new().add_modifier(Modifier::REVERSED),
-                )),
-                Rect::new(x.min(area.x + area.width.saturating_sub(1)), area.y, 1, 1),
-            );
-        }
+    if area.width == 0 || area.height == 0 {
+        return;
     }
+    let (visible, cursor_x) = editor.view(area.width.saturating_sub(1) as usize);
+    f.render_widget(Paragraph::new(visible), area);
+    let x = (area.x + cursor_x as u16).min(area.x + area.width - 1);
+    f.set_cursor_position((x, area.y));
 }
 
 fn draw_input(
@@ -774,8 +784,19 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
     }
 }
 
-fn draw_help(f: &mut Frame, area: Rect, editor: &mut Editor, cursor: usize, offset: usize) {
-    let rect = centered(area, 80, HELP_ROWS as u16 + 4);
+fn help_rect(area: Rect) -> Rect {
+    centered(area, 80, HELP_ROWS as u16 + 4)
+}
+
+fn draw_help(
+    f: &mut Frame,
+    area: Rect,
+    editor: &mut Editor,
+    items: &[keymap::HelpItem],
+    cursor: usize,
+    offset: usize,
+) {
+    let rect = help_rect(area);
     f.render_widget(Clear, rect);
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
@@ -786,7 +807,6 @@ fn draw_help(f: &mut Frame, area: Rect, editor: &mut Editor, cursor: usize, offs
     if inner.height < 3 {
         return;
     }
-    let entries = keymap::help_entries(&editor.value());
     let filter = Rect { height: 1, ..inner };
     draw_editor_line(f, filter, editor);
     f.render_widget(
@@ -805,13 +825,13 @@ fn draw_help(f: &mut Frame, area: Rect, editor: &mut Editor, cursor: usize, offs
         height: inner.height - 2,
         ..inner
     };
-    for (i, b) in entries
+    for (i, b) in items
         .iter()
         .enumerate()
         .skip(offset)
         .take(list.height as usize)
     {
-        let keys = format!("{:<20}", fit(&keymap::chord_label(b.on), 19));
+        let keys = format!("{:<20}", fit(&b.keys, 19));
         let text = format!("{keys}{}", b.desc);
         let text = format!(
             "{:<w$}",
@@ -830,7 +850,13 @@ fn draw_help(f: &mut Frame, area: Rect, editor: &mut Editor, cursor: usize, offs
     }
 }
 
-fn draw_spot(f: &mut Frame, area: Rect, rows: &[(String, Option<String>)], selected: usize) {
+fn draw_spot(
+    f: &mut Frame,
+    area: Rect,
+    rows: &[(String, Option<String>)],
+    selected: usize,
+    pending_c: bool,
+) {
     let rect = centered(area, 60, 20);
     f.render_widget(Clear, rect);
     let block = Block::bordered()
@@ -841,13 +867,16 @@ fn draw_spot(f: &mut Frame, area: Rect, rows: &[(String, Option<String>)], selec
     f.render_widget(block, rect);
     let inner = Rect {
         x: inner.x + 1,
-        y: inner.y + 1,
         width: inner.width.saturating_sub(2),
-        height: inner.height.saturating_sub(2),
+        ..inner
     };
     let label_w = 16u16.min(inner.width);
-    for (i, (label, value)) in rows.iter().enumerate().take(inner.height as usize) {
-        let y = inner.y + i as u16;
+    let value_w = inner.width.saturating_sub(label_w);
+    // Scroll so the selected row stays visible on short terminals.
+    let visible = inner.height as usize;
+    let offset = (selected + 1).saturating_sub(visible);
+    for (i, (label, value)) in rows.iter().enumerate().skip(offset).take(visible) {
+        let y = inner.y + (i - offset) as u16;
         match value {
             None => f.render_widget(
                 Paragraph::new(Span::styled(clean(label), Style::new().fg(Color::Green))),
@@ -858,31 +887,55 @@ fn draw_spot(f: &mut Frame, area: Rect, rows: &[(String, Option<String>)], selec
                     Paragraph::new(clean(label)),
                     Rect::new(inner.x, y, label_w, 1),
                 );
-                let vw = inner.width.saturating_sub(label_w);
-                let style = if i == selected {
-                    Style::new().add_modifier(Modifier::REVERSED)
-                } else {
-                    Style::new()
-                };
-                let text = format!("{:<w$}", fit(&clean(v), vw as usize), w = vw as usize);
                 f.render_widget(
-                    Paragraph::new(Span::styled(text, style)),
-                    Rect::new(inner.x + label_w, y, vw, 1),
+                    Paragraph::new(fit(&clean(v), value_w as usize)),
+                    Rect::new(inner.x + label_w, y, value_w, 1),
                 );
             }
         }
+        // yazi highlights the value column of the selected row, header rows too.
+        if i == selected {
+            f.buffer_mut().set_style(
+                Rect::new(inner.x + label_w, y, value_w, 1),
+                Style::new()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::REVERSED),
+            );
+        }
+    }
+    if pending_c {
+        let w = rect.width.saturating_sub(2);
+        let which = Rect::new(rect.x + 1, (rect.y + rect.height).saturating_sub(4), w, 3);
+        f.render_widget(Clear, which);
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(" c", Style::new().fg(Color::LightCyan)),
+                Span::styled("  ", Style::new().fg(Color::DarkGray)),
+                Span::styled("Copy selected cell", Style::new().fg(Color::LightMagenta)),
+            ]))
+            .block(
+                Block::bordered()
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::new().fg(BORDER)),
+            ),
+            which,
+        );
     }
 }
 
+/// Notices in the right part of `area`, stacked upward from its bottom like
+/// yazi's; a notice that does not fit completely is not drawn.
 fn draw_notices(f: &mut Frame, area: Rect, p: &Picker) {
     let w = 40u16.min(area.width);
-    let mut y = area.y;
-    for n in &p.notices {
+    let mut bottom = area.y + area.height;
+    for n in p.notices.iter().rev() {
         let text = Paragraph::new(clean(&n.message)).wrap(Wrap { trim: true });
-        let h = (text.line_count(w.saturating_sub(2)) as u16 + 2).min(6);
-        if y + h > area.y + area.height {
+        let h = text.line_count(w.saturating_sub(2)) as u16 + 2;
+        if bottom < area.y + h {
             break;
         }
+        bottom -= h;
+        let y = bottom;
         let rect = Rect::new(area.x + area.width - w, y, w, h);
         let color = match n.level {
             Level::Info => Color::Green,
@@ -898,6 +951,5 @@ fn draw_notices(f: &mut Frame, area: Rect, p: &Picker) {
             ),
             rect,
         );
-        y += h;
     }
 }

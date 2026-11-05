@@ -460,7 +460,8 @@ pub fn clean(path: &Path) -> PathBuf {
         match c {
             Component::CurDir => {}
             Component::ParentDir => {
-                if !out.pop() {
+                // `/..` stays `/`; only relative paths keep a leading `..`.
+                if !out.pop() && !out.has_root() {
                     out.push("..");
                 }
             }
@@ -538,6 +539,22 @@ pub fn preview_file(e: &Entry) -> Preview {
         Kind::Char => return Preview::Special("character device"),
         Kind::Symlink => return Preview::Special("broken symbolic link"),
         Kind::Dir | Kind::Other => return Preview::Special("special file"),
+    }
+    // The listing may be stale: check the type again right before opening, so a
+    // file replaced by a fifo or device cannot block the UI in `open`.
+    match std::fs::metadata(&e.path) {
+        Ok(m) if m.is_file() => {}
+        Ok(m) => {
+            let now = Entry {
+                kind: kind_of(&m),
+                ..e.clone()
+            };
+            return match now.kind {
+                Kind::File => Preview::Special("special file"),
+                _ => preview_file(&now),
+            };
+        }
+        Err(err) => return Preview::Unreadable(err.to_string()),
     }
     let mut buf = Vec::new();
     let read =
@@ -733,6 +750,29 @@ mod tests {
             assert_eq!(expand("~", cwd), h);
             assert_eq!(expand("~/Downloads", cwd), h.join("Downloads"));
         }
+    }
+
+    #[test]
+    fn clean_keeps_the_root() {
+        assert_eq!(clean(Path::new("/..")), PathBuf::from("/"));
+        assert_eq!(clean(Path::new("/a/../../b")), PathBuf::from("/b"));
+        assert_eq!(clean(Path::new("../x")), PathBuf::from("../x"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_listing_does_not_open_a_new_fifo() {
+        let dir = std::env::temp_dir().join(format!("thu-learn-fifo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("x");
+        std::fs::write(&path, b"text").unwrap();
+        let listed = Entry::from_path(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let made = std::process::Command::new("mkfifo").arg(&path).status();
+        if made.is_ok_and(|s| s.success()) {
+            assert_eq!(preview_file(&listed), Preview::Special("named pipe"));
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

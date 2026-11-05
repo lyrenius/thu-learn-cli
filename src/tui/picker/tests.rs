@@ -457,3 +457,247 @@ fn file_names_cannot_inject_escape_sequences() {
     assert!(!screen.contains('\u{1b}'));
     assert!(screen.contains("evil"));
 }
+
+// ---------- Regressions from the adversarial review ----------
+
+#[test]
+fn completion_follows_the_cursor_component() {
+    let fx = Fixture::new("cmp-move");
+    let mut p = fx.picker();
+    ch(&mut p, 'g');
+    ch(&mut p, ' ');
+    typed(&mut p, "Slides/lec");
+    key(&mut p, KeyCode::Home);
+    key(&mut p, KeyCode::Tab);
+    let Some(Popup::Input { editor, .. }) = &p.popup else {
+        panic!("input should stay open");
+    };
+    assert!(
+        !editor.value().contains("lecture1.pdf/"),
+        "a stale candidate must not be spliced in: {}",
+        editor.value()
+    );
+}
+
+#[test]
+fn completion_lists_dot_dot() {
+    let fx = Fixture::new("cmp-dots");
+    let mut p = fx.picker();
+    ch(&mut p, 'j');
+    ch(&mut p, 'l'); // into Slides
+    ch(&mut p, 'g');
+    ch(&mut p, ' ');
+    typed(&mut p, "..");
+    let Some(Popup::Input { cmp: Some(cmp), .. }) = &p.popup else {
+        panic!("completion should be active");
+    };
+    assert!(cmp.items.iter().any(|(n, _)| n == "answer.pdf"));
+    key(&mut p, KeyCode::Tab);
+    let Some(Popup::Input { editor, .. }) = &p.popup else {
+        panic!("input should stay open");
+    };
+    assert!(editor.value().starts_with("../"));
+}
+
+#[test]
+fn parent_tracks_a_hidden_cwd_after_showing_hidden_files() {
+    let fx = Fixture::new("parent-hidden");
+    std::fs::create_dir_all(fx.dir.join(".cfg")).unwrap();
+    let mut p = fx.picker();
+    ch(&mut p, 'g');
+    ch(&mut p, ' ');
+    typed(&mut p, ".cfg");
+    key(&mut p, KeyCode::Enter);
+    assert_eq!(p.cwd, fx.dir.join(".cfg"));
+    ch(&mut p, '.');
+    let parent = p.parent.as_ref().unwrap();
+    assert_eq!(parent.hovered().unwrap().name, ".cfg");
+}
+
+#[test]
+fn invert_keeps_selection_order() {
+    let fx = Fixture::new("invert");
+    let mut p = fx.picker();
+    ch(&mut p, 'j');
+    ch(&mut p, 'l'); // Slides
+    ch(&mut p, ' '); // Slides/lecture1.pdf
+    ch(&mut p, 'h');
+    ch(&mut p, 'G');
+    ch(&mut p, ' '); // report2.md
+    ctrl(&mut p, 'r'); // invert in the parent folder
+    assert_eq!(p.selected[0], fx.dir.join("Slides/lecture1.pdf"));
+    assert!(!p.selected.contains(&fx.dir.join("report2.md")));
+}
+
+#[test]
+fn spot_chord_and_multi_spotter() {
+    let fx = Fixture::new("spot");
+    let mut p = fx.picker();
+    ch(&mut p, 'G');
+    key(&mut p, KeyCode::Tab);
+    ch(&mut p, 'c');
+    assert_eq!(
+        ctrl(&mut p, 'c'),
+        Outcome::Continue,
+        "C-c must not complete `cc`"
+    );
+    key(&mut p, KeyCode::Esc);
+    ch(&mut p, ' ');
+    ch(&mut p, 'k');
+    key(&mut p, KeyCode::Tab);
+    let rows = p.spot_rows(None);
+    assert_eq!(
+        rows[0].0, "Multi",
+        "one selected file uses the multi spotter"
+    );
+    ch(&mut p, '~');
+    assert!(matches!(p.popup, Some(Popup::Help { spot: Some(_), .. })));
+    key(&mut p, KeyCode::Esc);
+    key(&mut p, KeyCode::Esc);
+    assert!(
+        matches!(p.popup, Some(Popup::Spot { .. })),
+        "help returns to the spot"
+    );
+}
+
+#[test]
+fn help_scrolls_within_the_drawn_height() {
+    let fx = Fixture::new("help-rows");
+    let mut p = fx.picker();
+    ch(&mut p, '~');
+    render(&mut p, 80, 24);
+    for _ in 0..30 {
+        key(&mut p, KeyCode::Down);
+    }
+    let screen = render(&mut p, 80, 24);
+    let Some(Popup::Help { scroll, .. }) = &p.popup else {
+        panic!("help should be open");
+    };
+    assert!(scroll.cursor >= scroll.offset && scroll.cursor < scroll.offset + p.help_limit);
+    let items = keymap::help_items(false, "");
+    assert!(screen.contains(items[scroll.cursor].desc));
+}
+
+#[test]
+fn seek_floors_like_yazi() {
+    let fx = Fixture::new("seek");
+    let mut p = fx.picker();
+    p.set_limits(21, 21);
+    for _ in 0..3 {
+        ch(&mut p, 'j');
+    }
+    assert_eq!(hovered(&p), "notes.txt");
+    ch(&mut p, 'J');
+    ch(&mut p, 'J');
+    let after_down = p.preview.as_ref().unwrap().skip;
+    ch(&mut p, 'K');
+    // floor(-5 * 21 / 10) = -11, one more than truncation would give.
+    assert_eq!(p.preview.as_ref().unwrap().skip, after_down - 11);
+}
+
+#[test]
+fn paste_cancels_a_pending_chord() {
+    let fx = Fixture::new("paste-chord");
+    let mut p = fx.picker();
+    ch(&mut p, 'g');
+    p.on_paste("/definitely/missing");
+    assert!(p.pending.is_empty());
+}
+
+#[test]
+fn filter_moves_trace_to_the_new_hovered_file() {
+    let fx = Fixture::new("filter-trace");
+    let mut p = fx.picker();
+    ch(&mut p, 'j');
+    ch(&mut p, 'j'); // answer.pdf
+    ch(&mut p, 'f');
+    typed(&mut p, r"\d");
+    key(&mut p, KeyCode::Enter);
+    let before = hovered(&p).to_string();
+    ch(&mut p, ',');
+    ch(&mut p, 'n');
+    assert_eq!(hovered(&p), before);
+}
+
+#[test]
+fn listings_refresh_when_the_folder_changes() {
+    let fx = Fixture::new("refresh");
+    let mut p = fx.picker();
+    std::thread::sleep(Duration::from_millis(20));
+    std::fs::write(fx.dir.join("new-file.pdf"), b"x").unwrap();
+    // Some filesystems keep a coarse directory mtime; force a visible change.
+    let later = std::time::SystemTime::now() + Duration::from_secs(5);
+    std::fs::File::open(&fx.dir)
+        .and_then(|f| f.set_modified(later))
+        .ok();
+    p.tick(Instant::now() + Duration::from_secs(2));
+    assert!(names(&p).contains(&"new-file.pdf"));
+}
+
+#[test]
+fn notices_leave_the_header_alone() {
+    let fx = Fixture::new("notice");
+    let mut p = fx.picker();
+    ch(&mut p, ' ');
+    ch(&mut p, ' ');
+    key(&mut p, KeyCode::Enter); // refused: two selected
+    let screen = render(&mut p, 80, 24);
+    let header = screen.lines().nth(1).unwrap();
+    assert!(
+        header.trim_end().ends_with('2'),
+        "selected count stays visible: {header}"
+    );
+}
+
+#[test]
+fn long_names_stay_whole_before_the_link_target() {
+    let fx = Fixture::new("longlink");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(
+        "../shared/some/far/away/target/hw3.pdf",
+        fx.dir.join("Homework3_report_final_v2.pdf"),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        let mut p = fx.picker();
+        let screen = render(&mut p, 80, 16);
+        assert!(screen.contains("Homework3_report_final_v2.pdf -> "));
+    }
+}
+
+#[test]
+fn tiny_terminals_do_not_panic() {
+    let fx = Fixture::new("tiny");
+    let mut p = fx.picker();
+    let sizes = [(1, 1), (2, 2), (10, 3), (20, 5), (40, 8), (80, 4)];
+    let setups: [&dyn Fn(&mut Picker); 6] = [
+        &|_| {},
+        &|p| {
+            ch(p, 'g');
+        },
+        &|p| {
+            ch(p, 'f');
+        },
+        &|p| {
+            ch(p, '~');
+        },
+        &|p| {
+            key(p, KeyCode::Tab);
+        },
+        &|p| {
+            ch(p, 'd');
+            ch(p, 'g');
+            ch(p, ' ');
+            typed(p, &format!("{}/", fx.dir.display()));
+        },
+    ];
+    for setup in setups {
+        let mut fresh = fx.picker();
+        setup(&mut fresh);
+        for (w, h) in sizes {
+            render(&mut fresh, w, h);
+        }
+    }
+    p.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+}

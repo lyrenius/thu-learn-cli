@@ -96,8 +96,9 @@ pub struct Editor {
     op: Option<char>,
     snaps: Vec<Snap>,
     snap_idx: usize,
-    /// Text cut or yanked by `d`/`c`/`y`/`x`, pasted by `p`/`P`.
-    register: String,
+    /// Text cut or yanked by `d`/`c`/`y`/`x`, pasted by `p`/`P`. The picker
+    /// shares it between inputs and with its copy keys.
+    pub register: String,
     /// Index into the history while recalling, and the unsent draft.
     recall: Option<usize>,
     draft: String,
@@ -141,7 +142,11 @@ impl Editor {
         self.recall = None;
     }
 
+    /// Inserts text at the cursor. Like yazi, nothing is typed in normal mode.
     pub fn insert_str(&mut self, text: &str) {
+        if self.mode == Mode::Normal {
+            return;
+        }
         for c in text.chars() {
             let c = if c == '\n' || c == '\r' { ' ' } else { c };
             if c.is_control() {
@@ -174,16 +179,21 @@ impl Editor {
         self.cursor = self.cursor.min(self.max_cursor());
     }
 
+    /// Records an undo step. An unchanged text only updates the cursor of the
+    /// last step, as yazi's `InputSnaps::tag` does.
     fn checkpoint(&mut self) {
-        let snap = Snap {
+        if let Some(last) = self.snaps.get_mut(self.snap_idx) {
+            if last.value == self.value {
+                last.cursor = self.cursor;
+                return;
+            }
+        }
+        self.snaps.truncate(self.snap_idx + 1);
+        self.snaps.push(Snap {
             value: self.value.clone(),
             cursor: self.cursor,
-        };
-        if self.snaps.get(self.snap_idx) != Some(&snap) {
-            self.snaps.truncate(self.snap_idx + 1);
-            self.snaps.push(snap);
-            self.snap_idx = self.snaps.len() - 1;
-        }
+        });
+        self.snap_idx = self.snaps.len() - 1;
     }
 
     fn restore(&mut self, idx: usize) {
@@ -221,25 +231,36 @@ impl Editor {
                     (Mode::Normal, None) => Edit::Cancel,
                 };
             }
-            // Word motions that skip punctuation: A-b/A-f and C-Left/C-Right.
-            KeyCode::Left if ctrl || alt => self.motion(self.backward(Gait::Lean)),
-            KeyCode::Char('b') if alt => self.motion(self.backward(Gait::Lean)),
-            KeyCode::Right if ctrl || alt => self.motion(self.forward(Gait::Lean, true)),
-            KeyCode::Char('f') if alt => self.motion(self.forward(Gait::Lean, true)),
-            KeyCode::Left => self.motion(self.cursor.saturating_sub(1)),
-            KeyCode::Char('b') if ctrl => self.motion(self.cursor.saturating_sub(1)),
-            KeyCode::Right => self.motion(self.cursor + 1),
-            KeyCode::Char('f') if ctrl => self.motion(self.cursor + 1),
-            KeyCode::Home => self.motion(0),
-            KeyCode::Char('a') if ctrl => self.motion(0),
-            KeyCode::End => self.motion(self.value.len()),
-            KeyCode::Char('e') if ctrl => self.motion(self.value.len()),
             KeyCode::Up => return self.recall(-1, history),
             KeyCode::Char('p') if ctrl => return self.recall(-1, history),
             KeyCode::Down => return self.recall(1, history),
             KeyCode::Char('n') if ctrl => return self.recall(1, history),
-            _ if self.mode == Mode::Insert => self.insert_key(key),
-            _ => self.normal_key(key, history),
+            KeyCode::Char('k' | 'j')
+                if self.mode == Mode::Normal && self.op.is_none() && !ctrl && !alt =>
+            {
+                let dir = if key.code == KeyCode::Char('k') {
+                    -1
+                } else {
+                    1
+                };
+                return self.recall(dir, history);
+            }
+            _ => {}
+        }
+        if let Some(target) = self.common_motion(key) {
+            // With an operator pending these keys are its motion, as in yazi.
+            match (self.mode, self.op.take()) {
+                (Mode::Normal, Some(op)) => {
+                    let len = self.value.len();
+                    let (a, b) = (self.cursor.min(target), self.cursor.max(target).min(len));
+                    self.apply_op(op, a, b);
+                }
+                _ => self.motion(target),
+            }
+        } else if self.mode == Mode::Insert {
+            self.insert_key(key);
+        } else {
+            self.normal_key(key);
         }
         let after = (&self.value, self.cursor, self.mode);
         if *after.0 != before.0 {
@@ -274,11 +295,39 @@ impl Editor {
         }
     }
 
-    fn normal_key(&mut self, key: KeyEvent, history: &[String]) {
+    /// Motions available in both modes: arrows, Home/End and their Emacs keys,
+    /// and word motions that skip punctuation (A-b/A-f, C-Left/C-Right).
+    fn common_motion(&self, key: KeyEvent) -> Option<usize> {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let operating = self.mode == Mode::Normal && self.op.is_some();
+        Some(match key.code {
+            KeyCode::Left if ctrl || alt => self.backward(Gait::Lean),
+            KeyCode::Char('b') if alt => self.backward(Gait::Lean),
+            KeyCode::Right if ctrl || alt => self.forward_op(Gait::Lean, true, operating),
+            KeyCode::Char('f') if alt => self.forward_op(Gait::Lean, true, operating),
+            KeyCode::Left => self.cursor.saturating_sub(1),
+            KeyCode::Char('b') if ctrl => self.cursor.saturating_sub(1),
+            KeyCode::Right => self.cursor + 1,
+            KeyCode::Char('f') if ctrl => self.cursor + 1,
+            KeyCode::Home => 0,
+            KeyCode::Char('a') if ctrl => 0,
+            KeyCode::End => self.value.len(),
+            KeyCode::Char('e') if ctrl => self.value.len(),
+            _ => return None,
+        })
+    }
+
+    fn normal_key(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let KeyCode::Char(c) = key.code else {
             return;
         };
+        // Alt combinations other than the word motions do nothing here.
+        if key.modifiers.contains(KeyModifiers::ALT) {
+            self.op = None;
+            return;
+        }
         if ctrl {
             if c == 'r' && self.snap_idx + 1 < self.snaps.len() {
                 self.restore(self.snap_idx + 1);
@@ -324,12 +373,6 @@ impl Editor {
             'p' => self.paste(true),
             'P' => self.paste(false),
             'u' if self.snap_idx > 0 => self.restore(self.snap_idx - 1),
-            'k' => {
-                self.recall(-1, history);
-            }
-            'j' => {
-                self.recall(1, history);
-            }
             c => {
                 if let Some(target) = self.motion_target(c, false) {
                     self.motion(target);
@@ -385,10 +428,6 @@ impl Editor {
             prev = k;
         }
         0
-    }
-
-    fn forward(&self, gait: Gait, end_of_word: bool) -> usize {
-        self.forward_op(gait, end_of_word, false)
     }
 
     fn forward_op(&self, gait: Gait, end_of_word: bool, operating: bool) -> usize {
@@ -530,20 +569,28 @@ impl Editor {
         let width = width.max(1);
         let w = |c: &char| c.width().unwrap_or(0);
         let margin = 5.min(width / 2);
-        if self.cursor < self.scroll + margin {
-            self.scroll = self.cursor.saturating_sub(margin);
-        }
+        let cursor = self.cursor.min(self.value.len());
+        // How many chars fit in `margin` cells on each side of the cursor.
+        let fit = |it: &mut dyn Iterator<Item = &char>| {
+            let mut used = 0;
+            it.take_while(|c| {
+                used += w(c);
+                used <= margin
+            })
+            .count()
+        };
+        let left_pad = fit(&mut self.value[..cursor].iter().rev());
+        let right_pad = fit(&mut self.value[cursor..].iter()).max(1);
+        self.scroll = self.scroll.min(cursor.saturating_sub(left_pad));
         loop {
-            let upto: usize = self.value[self.scroll..self.cursor.min(self.value.len())]
+            let upto: usize = self.value[self.scroll..cursor].iter().map(w).sum();
+            let after: usize = self.value[cursor..]
                 .iter()
+                .take(right_pad)
                 .map(w)
-                .sum();
-            let after: usize = self.value[self.cursor.min(self.value.len())..]
-                .iter()
-                .take(margin)
-                .map(w)
-                .sum();
-            if self.scroll < self.cursor && upto + after.max(1) > width {
+                .sum::<usize>()
+                .max(1);
+            if self.scroll < cursor && upto + after > width {
                 self.scroll += 1;
             } else {
                 break;
@@ -558,10 +605,7 @@ impl Editor {
             used += w(c);
             visible.push(*c);
         }
-        let cursor_x = self.value[self.scroll..self.cursor.min(self.value.len())]
-            .iter()
-            .map(w)
-            .sum();
+        let cursor_x = self.value[self.scroll..cursor].iter().map(w).sum();
         (visible, cursor_x)
     }
 }
@@ -672,6 +716,51 @@ mod tests {
         e.handle_key(key(KeyCode::Down), &history);
         e.handle_key(key(KeyCode::Down), &history);
         assert_eq!(e.value(), "dra");
+    }
+
+    #[test]
+    fn regressions_from_review() {
+        // One undo step per insert session, even after a cursor-only Esc.
+        let mut e = Editor::new("");
+        typed(&mut e, "abc");
+        e.handle_key(key(KeyCode::Esc), &[]);
+        e.handle_key(ch('h'), &[]);
+        e.handle_key(ch('i'), &[]);
+        e.handle_key(key(KeyCode::Esc), &[]);
+        e.handle_key(ch('u'), &[]);
+        assert_eq!(e.value(), "");
+        // Normal-mode k/j walk the history and bring back the draft.
+        let history = vec!["one".to_string(), "two".to_string()];
+        let mut e = Editor::new("draft");
+        e.handle_key(key(KeyCode::Esc), &[]);
+        e.handle_key(ch('k'), &history);
+        e.handle_key(ch('k'), &history);
+        assert_eq!(e.value(), "one");
+        e.handle_key(ch('j'), &history);
+        e.handle_key(ch('j'), &history);
+        assert_eq!(e.value(), "draft");
+        // Arrow keys complete a pending operator.
+        let mut e = Editor::new("abcdef");
+        e.handle_key(key(KeyCode::Esc), &[]);
+        e.handle_key(ch('d'), &[]);
+        e.handle_key(key(KeyCode::Home), &[]);
+        assert_eq!(e.value(), "f");
+        // Alt+letter does not run the plain letter in normal mode.
+        let alt_d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::ALT);
+        e.handle_key(alt_d, &[]);
+        e.handle_key(ch('w'), &[]);
+        assert_eq!(e.value(), "f");
+        // Paste does nothing in normal mode.
+        e.insert_str("xyz");
+        assert_eq!(e.value(), "f");
+        // CJK keeps left context in a narrow field.
+        let mut e = Editor::new(&"作业".repeat(8));
+        e.handle_key(key(KeyCode::Home), &[]);
+        for _ in 0..8 {
+            e.handle_key(key(KeyCode::Right), &[]);
+        }
+        let (_, x) = e.view(10);
+        assert!(x >= 4, "cursor column {x} should keep left context");
     }
 
     #[test]
