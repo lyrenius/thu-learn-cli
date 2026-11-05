@@ -51,7 +51,33 @@ The screen shows a list on the left and details for the selected item on the rig
 | `r` | Refresh from Learn |
 | `?` / `q` | Help / quit |
 
-Submitting opens a three-column file picker in the style of yazi or ranger: parent folder, current folder, and a preview of the selection. Use `↑`/`↓` or `j`/`k` to move, `←`/`→` or `h`/`l` to change folders, and `Enter` on a file to choose it. Then type an optional comment and press `Enter` to review; the confirmation shows the course, homework, file, and size before anything is sent, and `n` returns to the picker. In the picker, `/` filters the folder, `:` jumps to a typed path (with `Tab` completion), `.` shows hidden files, `~` goes home, and dragging a file into the terminal chooses it. The picker opens in the download folder and then remembers the last folder you submitted from.
+### Submission picker
+
+Submitting opens a file picker that looks and behaves like [yazi](https://github.com/sxyazi/yazi) with its default keymap: parent, current, and preview columns (1:4:3), yazi's header and status bar, and the same keys. Press `~` or `F1` inside the picker for the full list.
+
+| Keys | Action |
+| --- | --- |
+| `j`/`k`, `↑`/`↓` | Next/previous file (wraps around) |
+| `gg`/`G`, `C-u`/`C-d`, `C-b`/`C-f` | Top/bottom, half page, full page |
+| `h`/`l`, `←`/`→` | Parent folder / enter folder |
+| `H`/`L` | Back/forward in folder history |
+| `Enter`, `o` | Choose the selected or hovered file (on a folder: enter it) |
+| `Space`, `C-a`, `C-r` | Toggle selection, select all, invert |
+| `f` | Filter the folder (regex, smart case, remembered per folder) |
+| `/`, `?`, `n`, `N` | Find next/previous, jump to next/previous match |
+| `Esc` | Clear the find, then the filter, then the selection |
+| `.` | Show hidden files |
+| `,m` `,b` `,e` `,a` `,n` `,s` `,r` (uppercase reverses) | Sort by mtime, birth time, extension, name, natural, size, random |
+| `ms` `mp` `mb` `mm` `mo` `mn` | Linemode: size, permissions, birth time, mtime, owner, none |
+| `gh` `gc` `gd` `g<Space>` `gf` | Go home, `~/.config`, `~/Downloads`, typed path (with completion), follow symlink |
+| `cc` `cd` `cf` `cn` | Copy path, folder, file name, name without extension |
+| `J`/`K` | Scroll the preview |
+| `Tab` | File details (spot) |
+| `q`, `C-c` | Cancel the submission |
+
+Input popups work like yazi's: they open in insert mode, `Esc` switches to a vi-style normal mode, and a second `Esc` closes them. After choosing a file, type an optional comment and press `Enter`; the confirmation shows the course, homework, file, and size before anything is sent, and `n` returns to the picker as you left it. Dragging a file into the terminal chooses it.
+
+Differences from yazi, because the picker uploads exactly one file: `Enter` on a folder enters it instead of choosing it, choosing more than one file is refused, and keys that change files, run shell commands, use tabs, or call plugins (fd, rg, fzf, zoxide) show a notice instead. The picker opens in the download folder and then remembers the last folder you submitted from.
 
 Downloads go to the current directory unless `--dir` or `D` says otherwise, and never overwrite an existing file (a ` (1)` suffix is added). Detail panes show each item's short ID so it can be passed to CLI commands.
 
@@ -170,6 +196,7 @@ The hidden `thu-learn debug` command prints selected raw Learn API responses for
 * Learn API behavior references [thu-learn-lib](https://github.com/Harry-Chen/thu-learn-lib) (MIT, copyright 2019-2022 Harry Chen).
 * Browser-login behavior references [reserves-lib-tsinghua-downloader](https://github.com/libthu/reserves-lib-tsinghua-downloader) (GPL-3.0).
 * Silent re-login behavior (trusted device ID, SM2 password encryption, ticket roaming) references [learnX](https://github.com/robertying/learnX) and its [thu-learn-lib fork](https://github.com/robertying/thu-learn-lib) (MIT).
+* The submission picker follows [yazi](https://github.com/sxyazi/yazi)'s default keymap and behavior, and ports some of its code (MIT, copyright 2023 sxyazi). See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## License
 

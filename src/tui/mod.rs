@@ -5,8 +5,8 @@
 //! background results, and runs the [`app::Effect`]s it returns as tokio tasks.
 
 mod app;
-mod browser;
 mod input;
+mod picker;
 mod ui;
 
 use std::path::{Path, PathBuf};
@@ -228,6 +228,9 @@ impl Runtime {
                     );
                 });
             }
+            Effect::Copy(text) => {
+                tokio::task::spawn_blocking(move || copy_to_clipboard(&text));
+            }
             Effect::OpenPath(path) => {
                 if let Err(e) = open_path(&path) {
                     send(&tx, Msg::OpenFailed(e));
@@ -383,4 +386,77 @@ fn open_path(path: &Path) -> Result<(), String> {
         .spawn()
         .map(|_| ())
         .map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Copies text like yazi: an OSC 52 escape for the terminal (works over SSH),
+/// then the first desktop clipboard tool that succeeds.
+fn copy_to_clipboard(text: &str) {
+    use std::io::Write;
+    let osc = format!("\x1b]52;c;{}\x1b\\", base64(text.as_bytes()));
+    let mut out = std::io::stdout();
+    out.write_all(osc.as_bytes()).ok();
+    out.flush().ok();
+    let tools: [(&str, &[&str]); 5] = [
+        ("pbcopy", &[]),
+        ("termux-clipboard-set", &[]),
+        ("wl-copy", &[]),
+        ("xclip", &["-selection", "clipboard"]),
+        ("xsel", &["-ib"]),
+    ];
+    for (tool, args) in tools {
+        let child = std::process::Command::new(tool)
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        let Ok(mut child) = child else {
+            continue;
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(text.as_bytes()).ok();
+        }
+        if child.wait().is_ok_and(|s| s.success()) {
+            return;
+        }
+    }
+}
+
+/// Standard base64 with padding, for OSC 52.
+fn base64(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn base64_matches_rfc4648_vectors() {
+        assert_eq!(super::base64(b""), "");
+        assert_eq!(super::base64(b"f"), "Zg==");
+        assert_eq!(super::base64(b"fo"), "Zm8=");
+        assert_eq!(super::base64(b"foobar"), "Zm9vYmFy");
+        assert_eq!(super::base64("作业".as_bytes()), "5L2c5Lia");
+    }
 }

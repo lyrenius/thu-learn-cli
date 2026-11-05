@@ -13,10 +13,10 @@ use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::app::{
-    human_size, is_overdue, AnnouncementFilter, App, DetailState, HomeworkFilter, Overlay, Session,
-    StatusKind, SubmitState, Tab,
+    is_overdue, AnnouncementFilter, App, DetailState, HomeworkFilter, Overlay, Session, StatusKind,
+    SubmitState, Tab,
 };
-use super::browser::{Entry, FilePicker, Focus, Preview};
+use super::picker::view as picker_view;
 use crate::cli::strip_terminal_controls;
 use crate::models::{short_id, Course, CourseFile, Homework, HomeworkStatus, Notification};
 
@@ -195,6 +195,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             title, lines, back, ..
         }) => {
             if let Some(submit) = back {
+                submit.picker.notices.clear();
                 draw_submit(f, submit);
             }
             draw_confirm(f, title, lines)
@@ -310,22 +311,8 @@ fn draw_keys(f: &mut Frame, app: &App, area: Rect) {
             Overlay::CoursePicker { .. } => {
                 vec![("↑↓", "choose"), ("⏎", "apply"), ("Esc", "cancel")]
             }
-            Overlay::Submit(submit) => match submit.picker.focus {
-                Focus::Browser => vec![
-                    ("↑↓", "move"),
-                    ("←→", "folder"),
-                    ("⏎", "choose"),
-                    ("Tab", "comment"),
-                    ("/", "filter"),
-                    (":", "go to"),
-                    (".", "hidden"),
-                    ("~", "home"),
-                    ("Esc", "cancel"),
-                ],
-                Focus::Filter => vec![("type", "to filter"), ("⏎", "done"), ("Esc", "clear")],
-                Focus::GoTo => vec![("Tab", "complete"), ("⏎", "go"), ("Esc", "back")],
-                Focus::Comment => vec![("⏎", "review"), ("Tab", "files"), ("Esc", "back")],
-            },
+            // The picker draws its own header and status bar over everything.
+            Overlay::Submit(_) => Vec::new(),
             Overlay::Confirm { .. } => vec![("y", "confirm"), ("n", "cancel")],
             Overlay::DownloadDir { .. } => {
                 vec![("Tab", "complete"), ("⏎", "save"), ("Esc", "cancel")]
@@ -1227,306 +1214,54 @@ fn input_line(f: &mut Frame, area: Rect, label: &str, input: &super::input::Inpu
 }
 
 fn draw_submit(f: &mut Frame, submit: &mut SubmitState) {
-    // Leave the header and the key-hint rows visible.
-    let full = f.area();
-    let area = Rect {
-        x: full.x,
-        y: full.y + 1,
-        width: full.width,
-        height: full.height.saturating_sub(2),
+    let ctx = picker_view::Context {
+        course: &submit.course,
+        title: &submit.title,
     };
+    picker_view::draw(f, f.area(), &mut submit.picker, &ctx);
+}
+
+/// A confirmation in yazi's style: centred title, body, and `[Y]es`/`(N)o`.
+fn draw_confirm(f: &mut Frame, title: &str, lines: &[String]) {
+    let width = f.area().width.saturating_sub(4).min(70);
+    let text: Vec<Line<'static>> = lines.iter().map(|l| Line::raw(clean(l))).collect();
+    let body = Paragraph::new(Text::from(text)).wrap(Wrap { trim: false });
+    let inner_w = width.saturating_sub(4);
+    let height = body.line_count(inner_w) as u16 + 6;
+    let area = centered(f.area(), width, height);
     f.render_widget(Clear, area);
-    let course = fit(&course_label(&submit.course), 24);
-    let title_w =
-        (area.width as usize).saturating_sub(UnicodeWidthStr::width(course.as_str()) + 16);
     let b = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(ACCENT))
-        .title(Line::from(vec![
-            Span::styled(" Submit · ", Style::new().fg(Color::White).bold()),
-            Span::styled(course, Style::new().fg(ACCENT)),
-            Span::styled(" | ", muted()),
-            Span::styled(
-                format!("{} ", fit(&clean(&submit.title), title_w)),
-                Style::new().fg(Color::White).bold(),
-            ),
-        ]));
-    let inner = b.inner(area).inner(Margin::new(1, 0));
+        .border_style(Style::new().fg(Color::Blue))
+        .title(Line::styled(format!(" {title} "), Style::new().fg(Color::White).bold()).centered());
+    let inner = b.inner(area).inner(Margin::new(1, 1));
     f.render_widget(b, area);
-
-    let p = &mut submit.picker;
-    let extra_h = u16::from(p.focus == Focus::GoTo && !p.goto_candidates.is_empty());
-    let [path_row, columns, _, file_row, comment_row, message_row, extra_row] = Layout::vertical([
-        Constraint::Length(1),
+    let [body_area, _, buttons] = Layout::vertical([
         Constraint::Fill(1),
         Constraint::Length(1),
         Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(extra_h),
     ])
     .areas(inner);
-
-    // Current folder, with `~` for home and a marker when hidden files are shown.
-    let mut path_spans = vec![Span::styled(tilde(&p.cwd), Style::new().fg(ACCENT).bold())];
-    if p.show_hidden {
-        path_spans.push(Span::styled("  (hidden files shown)", muted()));
-    }
-    f.render_widget(Paragraph::new(Line::from(path_spans)), path_row);
-
-    let [parent_area, current_area, preview_area] = Layout::horizontal([
-        Constraint::Ratio(1, 5),
-        Constraint::Ratio(2, 5),
-        Constraint::Ratio(2, 5),
-    ])
-    .areas(columns);
-    // Thin dividers between the columns, like a Miller-column file manager.
-    let divider = Block::new()
-        .borders(ratatui::widgets::Borders::LEFT)
-        .border_style(muted())
-        .padding(ratatui::widgets::Padding::left(1));
-    let current_inner = divider.inner(current_area);
-    let preview_inner = divider.inner(preview_area);
-    f.render_widget(divider.clone(), current_area);
-    f.render_widget(divider, preview_area);
-    let (current_area, preview_area) = (current_inner, preview_inner);
-    draw_picker_parent(f, p, parent_area);
-    draw_picker_current(f, p, current_area);
-    draw_picker_preview(f, p, preview_area);
-
-    // Chosen file.
-    let file_line = match &p.chosen {
-        Some(path) => {
-            let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-            Line::from(vec![
-                Span::styled(format!("{:<10}", "File"), muted()),
-                Span::styled(
-                    format!("✓ {}", tilde(path)),
-                    Style::new().fg(Color::Green).bold(),
-                ),
-                Span::styled(format!("  {}", human_size(size)), muted()),
-            ])
-        }
-        None => Line::from(vec![
-            Span::styled(format!("{:<10}", "File"), muted()),
-            Span::styled("none yet: press Enter on a file", muted()),
-        ]),
-    };
-    f.render_widget(Paragraph::new(file_line), file_row);
-    input_line(
-        f,
-        comment_row,
-        "Comment",
-        &p.comment,
-        p.focus == Focus::Comment,
-    );
-
-    // Third line: the active filter or go-to field, else an error or warning.
-    match p.focus {
-        Focus::Filter => input_line(f, message_row, "Filter", &p.filter, true),
-        Focus::GoTo => input_line(f, message_row, "Go to", &p.goto, true),
-        _ => {
-            let line = if let Some(e) = &p.error {
-                Line::styled(clean(e), Style::new().fg(Color::Red))
-            } else if let Some(e) = p.listing_error() {
-                Line::styled(
-                    format!("Cannot read this folder: {}", clean(e)),
-                    Style::new().fg(Color::Red),
-                )
-            } else if !p.filter.is_empty() {
-                Line::from(vec![
-                    Span::styled(format!("{:<10}", "Filter"), muted()),
-                    Span::styled(clean(p.filter.value()), Style::new().fg(ACCENT)),
-                    Span::styled("  (Esc clears)", muted()),
-                ])
-            } else if submit.already_submitted {
-                Line::styled(
-                    "This homework already has a submission.",
-                    Style::new().fg(Color::Yellow),
-                )
-            } else {
-                Line::raw("")
-            };
-            f.render_widget(Paragraph::new(line), message_row);
-        }
-    }
-    if p.focus == Focus::GoTo {
-        if let Some(e) = &p.error {
-            f.render_widget(
-                Paragraph::new(Line::styled(clean(e), Style::new().fg(Color::Red))),
-                extra_row,
-            );
-        } else if !p.goto_candidates.is_empty() {
-            f.render_widget(
-                Paragraph::new(Span::styled(p.goto_candidates.join("  "), muted())),
-                extra_row,
-            );
-        }
-    }
-}
-
-fn tilde(path: &std::path::Path) -> String {
-    let shown = directories::BaseDirs::new()
-        .and_then(|d| {
-            path.strip_prefix(d.home_dir())
-                .ok()
-                .map(|rest| format!("~/{}", rest.display()))
-        })
-        .unwrap_or_else(|| path.display().to_string());
-    clean(shown.trim_end_matches('/'))
-}
-
-fn entry_line(e: &Entry, width: usize, chosen: bool) -> Line<'static> {
-    let (name, style) = if e.is_dir {
-        (
-            format!("{}/", e.name),
-            Style::new().fg(Color::LightBlue).bold(),
-        )
-    } else if chosen {
-        (e.name.clone(), Style::new().fg(Color::Green).bold())
-    } else {
-        (e.name.clone(), Style::new())
-    };
-    let mark = if chosen { "✓ " } else { "  " };
-    let size = if e.is_dir {
-        String::new()
-    } else {
-        human_size(e.size)
-    };
-    let name_w = width.saturating_sub(2 + UnicodeWidthStr::width(size.as_str()) + 1);
-    let name = fit(&clean(&name), name_w);
-    let pad = name_w.saturating_sub(UnicodeWidthStr::width(name.as_str()));
-    Line::from(vec![
-        Span::styled(mark, Style::new().fg(Color::Green)),
-        Span::styled(name, style),
-        Span::raw(" ".repeat(pad + 1)),
-        Span::styled(size, muted()),
-    ])
-}
-
-fn draw_picker_parent(f: &mut Frame, p: &mut FilePicker, area: Rect) {
-    let cwd = p.cwd.clone();
-    let width = area.width as usize;
-    let Some(entries) = p.parent_entries() else {
-        return;
-    };
-    let selected = entries.iter().position(|e| e.path == cwd);
-    let items: Vec<ListItem> = entries
-        .iter()
-        .map(|e| {
-            let name = fit(
-                &clean(&format!("{}{}", e.name, if e.is_dir { "/" } else { "" })),
-                width,
-            );
-            let style = if e.is_dir {
-                Style::new().fg(Color::Blue)
-            } else {
-                muted()
-            };
-            ListItem::new(Line::styled(name, style))
-        })
-        .collect();
-    let list =
-        List::new(items).highlight_style(Style::new().bg(Color::Indexed(237)).fg(Color::White));
-    let mut state = ListState::default().with_selected(selected);
-    f.render_stateful_widget(list, area, &mut state);
-}
-
-fn draw_picker_current(f: &mut Frame, p: &mut FilePicker, area: Rect) {
-    // One cell of margin before the divider to the preview column.
-    let width = (area.width as usize).saturating_sub(1);
-    let chosen = p.chosen.clone();
-    let visible = p.visible();
-    if visible.is_empty() {
-        let text = if p.filter.is_empty() {
-            "(empty folder)"
-        } else {
-            "(no matches)"
-        };
-        f.render_widget(Paragraph::new(Line::styled(text, muted())), area);
-        return;
-    }
-    let items: Vec<ListItem> = visible
-        .iter()
-        .map(|e| ListItem::new(entry_line(e, width, chosen.as_ref() == Some(&e.path))))
-        .collect();
-    let browsing = matches!(p.focus, Focus::Browser | Focus::Filter);
-    let highlight = if browsing {
-        Style::new().bg(Color::DarkGray).fg(Color::White)
-    } else {
-        Style::new().bg(Color::Indexed(237))
-    };
-    let list = List::new(items).highlight_style(highlight);
-    let mut state = ListState::default()
-        .with_offset(p.offset)
-        .with_selected(Some(p.selected));
-    f.render_stateful_widget(list, area, &mut state);
-    p.offset = state.offset();
-}
-
-fn draw_picker_preview(f: &mut Frame, p: &mut FilePicker, area: Rect) {
-    let width = area.width as usize;
-    let Some(entry) = p.current().cloned() else {
-        return;
-    };
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    if !entry.is_dir {
-        let modified = entry
-            .modified
-            .map(|t| {
-                chrono::DateTime::<Local>::from(t)
-                    .format("%Y-%m-%d %H:%M")
-                    .to_string()
-            })
-            .unwrap_or_default();
-        lines.push(Line::styled(
-            fit(&clean(&entry.name), width),
-            Style::new().fg(Color::White).bold(),
-        ));
-        lines.push(Line::styled(
-            format!("{} · {modified}", human_size(entry.size)),
-            muted(),
-        ));
-        lines.push(Line::raw(""));
-    }
-    match p.preview() {
-        Some(Preview::Directory(Ok(children))) if children.is_empty() => {
-            lines.push(Line::styled("(empty folder)", muted()));
-        }
-        Some(Preview::Directory(Ok(children))) => {
-            for e in children.iter().take(area.height as usize) {
-                lines.push(entry_line(e, width, false));
-            }
-        }
-        Some(Preview::Directory(Err(e))) | Some(Preview::Unreadable(e)) => {
-            lines.push(Line::styled(clean(e), Style::new().fg(Color::Red)));
-        }
-        Some(Preview::Binary) => lines.push(Line::styled("(binary file, no preview)", muted())),
-        Some(Preview::Text(text)) => {
-            for l in text.iter().take(area.height as usize) {
-                let l = strip_terminal_controls(&l.replace('\t', "    "));
-                lines.push(Line::raw(fit(l.trim_end(), width)));
-            }
-        }
-        None => {}
-    }
-    f.render_widget(Paragraph::new(Text::from(lines)), area);
-}
-
-fn draw_confirm(f: &mut Frame, title: &str, lines: &[String]) {
-    let width = f.area().width.saturating_sub(4).min(84);
-    let mut text: Vec<Line<'static>> = lines.iter().map(|l| Line::raw(clean(l))).collect();
-    text.push(Line::raw(""));
-    let mut spans = key_hint("y", "confirm");
-    spans.extend(key_hint("n", "cancel"));
-    text.push(Line::from(spans));
-    let p = Paragraph::new(Text::from(text)).wrap(Wrap { trim: false });
-    let inner_w = width.saturating_sub(4);
-    let height = p.line_count(inner_w) as u16 + 4;
-    let (area, b) = popup(f, width, height, title);
+    f.render_widget(body, body_area);
+    let [yes, no] =
+        Layout::horizontal([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)]).areas(buttons);
     f.render_widget(
-        p.block(b.padding(ratatui::widgets::Padding::uniform(1))),
-        area,
+        Paragraph::new(Line::from(vec![
+            Span::styled("  [", muted()),
+            Span::styled("Y", Style::new().fg(ACCENT).bold()),
+            Span::styled("]es  ", muted()),
+        ]))
+        .centered(),
+        yes,
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("  (", muted()),
+            Span::styled("N", Style::new().fg(ACCENT).bold()),
+            Span::styled(")o  ", muted()),
+        ]))
+        .centered(),
+        no,
     );
 }
 

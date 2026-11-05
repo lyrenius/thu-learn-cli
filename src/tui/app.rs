@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Local};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use super::browser::{FilePicker, Focus};
 use super::input::{complete_path, expand_path, normalize_pasted_path, Input};
+use super::picker::{Outcome, Picker};
 use crate::models::{
     Course, CourseFile, Homework, HomeworkAttachment, HomeworkStatus, Notification,
 };
@@ -207,6 +207,8 @@ pub enum Effect {
         comment: String,
     },
     OpenPath(PathBuf),
+    /// Put text on the system clipboard (the picker's `c` keys).
+    Copy(String),
 }
 
 /// Results reported back by background work.
@@ -254,7 +256,7 @@ pub struct SubmitState {
     pub title: String,
     pub course: String,
     pub already_submitted: bool,
-    pub picker: FilePicker,
+    pub picker: Picker,
 }
 
 #[derive(Debug, Clone)]
@@ -697,6 +699,9 @@ impl App {
     pub fn on_tick(&mut self, now: Instant, wall: DateTime<Local>) -> Vec<Effect> {
         self.spinner = self.spinner.wrapping_add(1);
         self.now = wall;
+        if let Some(Overlay::Submit(submit)) = self.overlay.as_mut() {
+            submit.picker.tick(now);
+        }
         if let Some(status) = &self.status {
             let ttl = if status.kind == StatusKind::Error {
                 ERROR_TTL
@@ -735,30 +740,7 @@ impl App {
 
     pub fn on_paste(&mut self, text: &str) {
         match &mut self.overlay {
-            Some(Overlay::Submit(submit)) => {
-                let picker = &mut submit.picker;
-                match picker.focus {
-                    Focus::Comment => picker.comment.insert_str(&text.replace(['\r', '\n'], " ")),
-                    Focus::Filter => {
-                        picker.filter.insert_str(text.trim());
-                        picker.filter_changed();
-                    }
-                    Focus::GoTo => picker.goto.insert_str(&normalize_pasted_path(text)),
-                    Focus::Browser => {
-                        // A dragged-in file is taken as the choice.
-                        let path = expand_path(&normalize_pasted_path(text));
-                        match picker.go_to(&path) {
-                            Ok(()) if path.is_file() => {
-                                picker.chosen = picker.current().map(|e| e.path.clone());
-                                picker.focus = Focus::Comment;
-                                picker.error = None;
-                            }
-                            Ok(()) => picker.error = None,
-                            Err(e) => picker.error = Some(e),
-                        }
-                    }
-                }
-            }
+            Some(Overlay::Submit(submit)) => submit.picker.on_paste(text),
             Some(Overlay::DownloadDir { input, .. }) => {
                 input.insert_str(&normalize_pasted_path(text));
             }
@@ -770,7 +752,16 @@ impl App {
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> Vec<Effect> {
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        // Ctrl-C quits, except in the submit picker, where it closes the picker
+        // or its confirmation as in yazi.
+        let in_picker = matches!(
+            self.overlay,
+            Some(Overlay::Submit(_)) | Some(Overlay::Confirm { back: Some(_), .. })
+        );
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.code == KeyCode::Char('c')
+            && !in_picker
+        {
             self.should_quit = true;
             return Vec::new();
         }
@@ -1051,7 +1042,7 @@ impl App {
             title: hw.title.clone(),
             course,
             already_submitted: hw.status != HomeworkStatus::Pending,
-            picker: FilePicker::open(&self.submit_dir),
+            picker: Picker::open(&self.submit_dir),
         })));
     }
 
@@ -1089,11 +1080,15 @@ impl App {
                 }
                 self.overlay = Some(Overlay::CoursePicker { selected });
             }
-            Overlay::Submit(mut submit) => {
-                if self.on_submit_key(&mut submit, key) {
+            Overlay::Submit(mut submit) => match submit.picker.on_key(key) {
+                Outcome::Continue => self.overlay = Some(Overlay::Submit(submit)),
+                Outcome::Cancel => self.info("Submission cancelled."),
+                Outcome::Copy(text) => {
                     self.overlay = Some(Overlay::Submit(submit));
+                    return vec![Effect::Copy(text)];
                 }
-            }
+                Outcome::Submit { file, comment } => self.review_submission(submit, file, comment),
+            },
             Overlay::Confirm {
                 title,
                 lines,
@@ -1108,6 +1103,10 @@ impl App {
                     return vec![*effect];
                 }
                 KeyCode::Char('n' | 'N' | 'q') | KeyCode::Esc => match back {
+                    Some(submit) => self.overlay = Some(Overlay::Submit(submit)),
+                    None => self.info("Cancelled."),
+                },
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => match back {
                     Some(submit) => self.overlay = Some(Overlay::Submit(submit)),
                     None => self.info("Cancelled."),
                 },
@@ -1150,135 +1149,17 @@ impl App {
         Vec::new()
     }
 
-    /// Handles a key on the submit screen. Returns `false` when the screen closes.
-    fn on_submit_key(&mut self, submit: &mut SubmitState, key: KeyEvent) -> bool {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let p = &mut submit.picker;
-        match p.focus {
-            Focus::Filter => match key.code {
-                KeyCode::Esc => {
-                    p.filter.clear();
-                    p.filter_changed();
-                    p.focus = Focus::Browser;
-                }
-                KeyCode::Enter => p.focus = Focus::Browser,
-                KeyCode::Down => p.move_by(1),
-                KeyCode::Up => p.move_by(-1),
-                _ => {
-                    if p.filter.handle_key(key) {
-                        p.filter_changed();
-                    }
-                }
-            },
-            Focus::GoTo => match key.code {
-                KeyCode::Esc => {
-                    p.goto.clear();
-                    p.goto_candidates.clear();
-                    p.error = None;
-                    p.focus = Focus::Browser;
-                }
-                KeyCode::Tab => {
-                    let completion = complete_path(p.goto.value());
-                    p.goto_candidates = completion.candidates;
-                    if let Some(v) = completion.value {
-                        p.goto.set(v);
-                    }
-                }
-                KeyCode::Enter => match p.go_to(&expand_path(p.goto.value())) {
-                    Ok(()) => {
-                        p.goto.clear();
-                        p.goto_candidates.clear();
-                        p.error = None;
-                        p.focus = Focus::Browser;
-                    }
-                    Err(e) => p.error = Some(e),
-                },
-                _ => {
-                    if p.goto.handle_key(key) {
-                        p.error = None;
-                        p.goto_candidates.clear();
-                    }
-                }
-            },
-            Focus::Comment => match key.code {
-                KeyCode::Esc | KeyCode::Tab | KeyCode::BackTab | KeyCode::Up => {
-                    p.focus = Focus::Browser
-                }
-                KeyCode::Enter => return !self.review_submission(submit),
-                _ => {
-                    p.comment.handle_key(key);
-                }
-            },
-            Focus::Browser => match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => {
-                    if p.filter.is_empty() {
-                        self.info("Submission cancelled.");
-                        return false;
-                    }
-                    p.filter.clear();
-                    p.filter_changed();
-                }
-                KeyCode::Down | KeyCode::Char('j') => p.move_by(1),
-                KeyCode::Up | KeyCode::Char('k') => p.move_by(-1),
-                KeyCode::Char('d') if ctrl => p.move_by(PAGE as isize),
-                KeyCode::Char('u') if ctrl => p.move_by(-(PAGE as isize)),
-                KeyCode::PageDown => p.move_by(PAGE as isize),
-                KeyCode::PageUp => p.move_by(-(PAGE as isize)),
-                KeyCode::Home | KeyCode::Char('g') => p.move_by(isize::MIN / 2),
-                KeyCode::End | KeyCode::Char('G') => p.move_by(isize::MAX / 2),
-                KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace => p.parent(),
-                KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter => {
-                    if let Some(file) = p.open_selected() {
-                        p.chosen = Some(file);
-                        p.focus = Focus::Comment;
-                        p.error = None;
-                    }
-                }
-                KeyCode::Char(' ') => {
-                    if let Some(path) = p.current().filter(|e| !e.is_dir).map(|e| e.path.clone()) {
-                        p.chosen = if p.chosen.as_ref() == Some(&path) {
-                            None
-                        } else {
-                            Some(path)
-                        };
-                    }
-                }
-                KeyCode::Char('.') => p.toggle_hidden(),
-                KeyCode::Char('~') => p.home(),
-                KeyCode::Char('/') => p.focus = Focus::Filter,
-                KeyCode::Char(':') => {
-                    let cwd = p.cwd.display().to_string();
-                    p.goto.set(format!("{}/", cwd.trim_end_matches('/')));
-                    p.focus = Focus::GoTo;
-                }
-                KeyCode::Tab => p.focus = Focus::Comment,
-                _ => {}
-            },
-        }
-        true
-    }
-
-    /// Moves a complete submission to the confirmation step. Returns whether it did.
-    fn review_submission(&mut self, submit: &mut SubmitState) -> bool {
-        let p = &mut submit.picker;
-        let Some(path) = p.chosen.clone() else {
-            p.error = Some("Choose a file first: press Enter on a file.".into());
-            p.focus = Focus::Browser;
-            return false;
-        };
-        if !path.is_file() {
-            p.error = Some(format!("Not a file: {}", path.display()));
-            p.focus = Focus::Browser;
-            return false;
-        }
-        self.submit_dir = p.cwd.clone();
-        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    /// Shows the confirmation for a file chosen in the picker; declining it
+    /// returns to the picker as it was.
+    fn review_submission(&mut self, submit: Box<SubmitState>, file: PathBuf, comment: String) {
+        self.submit_dir = submit.picker.cwd.clone();
+        let size = std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
         let mut lines = vec![
             format!("{} | {}", submit.course, submit.title),
-            format!("File: {} ({})", path.display(), human_size(size)),
+            format!("File: {} ({})", file.display(), human_size(size)),
         ];
-        if !p.comment.is_empty() {
-            lines.push(format!("Comment: {}", p.comment.value()));
+        if !comment.is_empty() {
+            lines.push(format!("Comment: {comment}"));
         }
         if submit.already_submitted {
             lines.push("This homework already has a submission.".into());
@@ -1288,12 +1169,11 @@ impl App {
             lines,
             effect: Box::new(Effect::Submit {
                 student_homework_id: submit.student_homework_id.clone(),
-                file: path,
-                comment: p.comment.value().to_string(),
+                file,
+                comment,
             }),
-            back: Some(Box::new(submit.clone())),
+            back: Some(submit),
         });
-        true
     }
 }
 
@@ -1596,45 +1476,50 @@ pub(crate) mod tests {
         );
     }
 
-    #[test]
-    fn submit_picks_file_in_browser_then_confirms() {
-        let dir = std::env::temp_dir().join(format!("thu-learn-submit-{}", std::process::id()));
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("thu-learn-{tag}-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::canonicalize(&dir).unwrap()
+    }
+
+    fn picker(app: &App) -> &Picker {
+        match &app.overlay {
+            Some(Overlay::Submit(s)) => &s.picker,
+            Some(Overlay::Confirm { back: Some(s), .. }) => &s.picker,
+            other => panic!("submit picker should be open, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn submit_picks_file_with_yazi_keys_then_confirms() {
+        let dir = temp_dir("submit");
         std::fs::create_dir_all(dir.join("drafts")).unwrap();
         std::fs::write(dir.join("answer.pdf"), b"pdf").unwrap();
-        let dir = std::fs::canonicalize(&dir).unwrap();
 
         let mut app = ready_app();
         app.submit_dir = dir.clone();
         press(&mut app, KeyCode::Char('s'));
-        let picker = |app: &App| match &app.overlay {
-            Some(Overlay::Submit(s)) => s.picker.clone(),
-            other => panic!("submit screen should be open, got {other:?}"),
-        };
         assert_eq!(picker(&app).cwd, dir);
 
-        // Enter on a folder opens it; h goes back and keeps the folder selected.
-        press(&mut app, KeyCode::Enter);
+        // l enters a folder; h returns with the folder hovered.
+        press(&mut app, KeyCode::Char('l'));
         assert_eq!(picker(&app).cwd, dir.join("drafts"));
         press(&mut app, KeyCode::Char('h'));
-        assert_eq!(picker(&app).current().unwrap().name, "drafts");
+        assert_eq!(picker(&app).hovered().unwrap().name, "drafts");
 
-        // Reviewing without a file explains what to do.
-        press(&mut app, KeyCode::Tab);
-        press(&mut app, KeyCode::Enter);
-        assert!(picker(&app).error.unwrap().starts_with("Choose a file"));
-
+        // j then Enter chooses the file and asks for a comment.
         press(&mut app, KeyCode::Char('j'));
-        press(&mut app, KeyCode::Enter); // choose answer.pdf, focus comment
-        assert_eq!(picker(&app).chosen, Some(dir.join("answer.pdf")));
-        assert_eq!(picker(&app).focus, Focus::Comment);
+        press(&mut app, KeyCode::Enter);
         type_text(&mut app, "final version");
         press(&mut app, KeyCode::Enter);
         assert!(matches!(app.overlay, Some(Overlay::Confirm { .. })));
 
-        // Declining returns to the picker with the choice intact.
+        // Declining returns to the picker in the same place.
         press(&mut app, KeyCode::Char('n'));
-        assert_eq!(picker(&app).comment.value(), "final version");
+        assert_eq!(picker(&app).hovered().unwrap().name, "answer.pdf");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Up); // recalls the previous comment
         press(&mut app, KeyCode::Enter);
         let effects = press(&mut app, KeyCode::Char('y'));
         assert_eq!(
@@ -1657,21 +1542,33 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn ctrl_c_closes_the_picker_instead_of_quitting() {
+        let mut app = ready_app();
+        app.submit_dir = std::env::temp_dir();
+        press(&mut app, KeyCode::Char('s'));
+        app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.overlay.is_none());
+        assert!(!app.should_quit);
+        app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.should_quit);
+    }
+
+    #[test]
     fn pasting_a_file_path_chooses_it() {
-        let dir = std::env::temp_dir().join(format!("thu-learn-paste-{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = temp_dir("paste");
         std::fs::write(dir.join("my report.pdf"), b"pdf").unwrap();
-        let dir = std::fs::canonicalize(&dir).unwrap();
 
         let mut app = ready_app();
         press(&mut app, KeyCode::Char('s'));
         app.on_paste(&format!("'{}'", dir.join("my report.pdf").display()));
-        let Some(Overlay::Submit(submit)) = &app.overlay else {
-            panic!("submit screen should stay open");
+        assert_eq!(picker(&app).cwd, dir);
+        press(&mut app, KeyCode::Enter); // empty comment
+        let Some(Overlay::Confirm { effect, .. }) = &app.overlay else {
+            panic!("confirmation should open");
         };
-        assert_eq!(submit.picker.chosen, Some(dir.join("my report.pdf")));
-        assert_eq!(submit.picker.focus, Focus::Comment);
+        assert!(
+            matches!(&**effect, Effect::Submit { file, .. } if file == &dir.join("my report.pdf"))
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
