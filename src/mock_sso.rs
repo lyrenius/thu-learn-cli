@@ -12,6 +12,7 @@ use sm2::pke::{DecryptingKey, Mode};
 use sm2::SecretKey;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -38,6 +39,12 @@ pub struct State {
     pub check_attempts: usize,
     /// Fields of the last login-check request.
     pub last_check: HashMap<String, String>,
+    /// Login-form requests received.
+    pub form_requests: usize,
+    /// Answer this many upcoming login-form requests with HTTP 503.
+    pub fail_forms: usize,
+    /// Delay before answering login-form requests.
+    pub form_delay: Duration,
     tickets: Vec<String>,
     counter: usize,
 }
@@ -63,6 +70,9 @@ impl MockSso {
             sso_logins: 0,
             check_attempts: 0,
             last_check: HashMap::new(),
+            form_requests: 0,
+            fail_forms: 0,
+            form_delay: Duration::ZERO,
             tickets: Vec::new(),
             counter: 0,
         }));
@@ -115,6 +125,10 @@ impl MockSso {
 
     pub fn check_attempts(&self) -> usize {
         self.state.lock().unwrap().check_attempts
+    }
+
+    pub fn form_requests(&self) -> usize {
+        self.state.lock().unwrap().form_requests
     }
 }
 
@@ -178,6 +192,14 @@ async fn serve(mut stream: TcpStream, state: &Mutex<State>, is_learn: bool, lear
     let Some(req) = read_request(&mut stream).await else {
         return;
     };
+    let delay = if is_learn || !req.path.starts_with("/do/off/ui/auth/login/form/") {
+        Duration::ZERO
+    } else {
+        state.lock().unwrap().form_delay
+    };
+    if !delay.is_zero() {
+        tokio::time::sleep(delay).await;
+    }
     let reply = {
         let mut s = state.lock().unwrap();
         if is_learn {
@@ -190,6 +212,7 @@ async fn serve(mut stream: TcpStream, state: &Mutex<State>, is_learn: bool, lear
         200 => "OK",
         302 => "Found",
         403 => "Forbidden",
+        503 => "Service Unavailable",
         _ => "Status",
     };
     let mut head = format!(
@@ -244,6 +267,11 @@ fn id_route(s: &mut State, req: &Request, learn: &str) -> Reply {
     let form_path = format!("/do/off/ui/auth/login/form/{}/0", crate::sso::LEARN_APP_ID);
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", p) if p == form_path => {
+            s.form_requests += 1;
+            if s.fail_forms > 0 {
+                s.fail_forms -= 1;
+                return Reply::status(503);
+            }
             s.counter += 1;
             Reply::html(login_form(&s.public_key_hex, None))
                 .cookie(ID_COOKIE, &format!("id-{}", s.counter))

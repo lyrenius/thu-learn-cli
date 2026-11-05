@@ -7,27 +7,37 @@
 // * answers the two-factor "trust this device" request with that fingerprint,
 // so later logins from the CLI can run over plain HTTP without two-factor prompts.
 //
-// What happened is recorded in localStorage on the ID origin under
-// `config.storageKey`, which the CLI polls through WebDriver.
+// What happened is recorded on the ID origin, in localStorage under
+// `config.storageKey` (polled through WebDriver) and in the `config.recordCookie`
+// cookie (read with the session cookies, in case the login check redirects
+// straight to Learn before the next poll).
 (function () {
   'use strict';
 
   const config = __THU_LEARN_CONFIG__;
-  if (location.hostname !== config.idHost) return;
+  // Exact origin, so the password is never filled into plain-HTTP or other pages.
+  if (location.origin !== config.idOrigin) return;
 
   // `是` ("yes"): the radio value that keeps this device trusted (learnX sends the same).
   const TRUST_YES = '是';
   const SAVE_FINGER_PATH = '/b/doubleAuth/personal/saveFinger';
 
   const remember = (patch) => {
+    let record = patch;
     try {
       const previous = JSON.parse(window.localStorage.getItem(config.storageKey) || '{}');
-      window.localStorage.setItem(
-        config.storageKey,
-        JSON.stringify(Object.assign(previous || {}, patch)),
-      );
+      record = Object.assign(previous || {}, patch);
+      window.localStorage.setItem(config.storageKey, JSON.stringify(record));
     } catch (e) {
-      // Storage may be unavailable; the CLI still verifies the result over HTTP.
+      // Storage may be unavailable; the cookie below and the HTTP check still work.
+    }
+    try {
+      document.cookie =
+        config.recordCookie + '=' + encodeURIComponent(JSON.stringify(record)) +
+        '; path=/; max-age=600; samesite=strict' +
+        (location.protocol === 'https:' ? '; secure' : '');
+    } catch (e) {
+      // Cookies may be disabled; localStorage still carries the record.
     }
   };
 
@@ -114,7 +124,8 @@
     if ($.fn.submit.__thuLearnHooked) return true;
     const originalSubmit = $.fn.submit;
     $.fn.submit = function () {
-      prepareForm(this[0]);
+      // `.submit(handler)` only binds a handler; `.submit()` submits.
+      if (arguments.length === 0) prepareForm(this[0]);
       return originalSubmit.apply(this, arguments);
     };
     $.fn.submit.__thuLearnHooked = true;

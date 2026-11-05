@@ -40,6 +40,7 @@ sm2 = { version = "0.14", default-features = false, features = ["arithmetic", "p
 keyring = "4.2"
 rpassword = "7"
 getrandom = { version = "0.4", features = ["sys_rng"] }
+sm3 = "0.5"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["net", "io-util"] }

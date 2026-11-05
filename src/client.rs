@@ -13,6 +13,7 @@ use reqwest::{Client as HttpClient, RequestBuilder, Response, StatusCode};
 use reqwest_cookie_store::{CookieStore, CookieStoreMutex};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::credentials::Credentials;
 use crate::sso::{self, SsoFailure};
@@ -95,7 +96,7 @@ impl std::fmt::Display for AuthError {
             AuthError::ReloginFailed(reason) => write!(
                 f,
                 "The session expired and automatic re-login failed: {reason}. \
-                 Run `thu-learn login` to sign in again."
+                 If this persists, run `thu-learn login` to sign in again."
             ),
         }
     }
@@ -103,29 +104,48 @@ impl std::fmt::Display for AuthError {
 
 impl std::error::Error for AuthError {}
 
-enum CredentialSlot {
-    /// Read the saved credentials the first time a re-login is needed.
-    Unloaded,
-    Loaded(Option<Credentials>),
+/// A failed re-login is not retried for this long, so a burst of requests shares one attempt.
+const RELOGIN_RETRY_PAUSE: Duration = Duration::from_secs(30);
+/// Upper bound for one complete HTTP login (four requests).
+const LOGIN_TIMEOUT: Duration = Duration::from_secs(60);
+
+enum CredentialSource {
+    /// Read the credential store on every renewal, so logins and logouts made by
+    /// other `thu-learn` processes take effect here too.
+    Saved,
+    /// Explicit credentials; `None` disables silent re-login.
+    Fixed(Option<Credentials>),
+}
+
+struct ReloginFailure {
+    reason: String,
+    at: Instant,
+    /// Tsinghua rejected these credentials; never retry them automatically
+    /// (repeated failed logins can trigger a captcha or lock the account).
+    definitive: bool,
+    /// Which credentials failed, so a different credential set is tried again.
+    digest: String,
 }
 
 struct Session {
     csrf: Option<String>,
     /// Incremented whenever a different session or `_csrf` token is installed.
     generation: u64,
-    /// Why re-login failed for `generation`; concurrent requests reuse it instead of
-    /// hammering `id.tsinghua.edu.cn` (repeated failures can trigger a captcha).
-    relogin_error: Option<String>,
+    failure: Option<ReloginFailure>,
 }
 
 pub struct Client {
     http: HttpClient,
     cookie_store: Arc<CookieStoreMutex>,
     cookie_path: PathBuf,
+    /// Marker file recording credentials that Tsinghua rejected, shared by all processes.
+    block_path: PathBuf,
     endpoints: Endpoints,
     session: tokio::sync::Mutex<Session>,
-    credentials: tokio::sync::Mutex<CredentialSlot>,
+    credentials: tokio::sync::Mutex<CredentialSource>,
     save_lock: std::sync::Mutex<()>,
+    retry_pause: Duration,
+    login_timeout: Duration,
 }
 
 impl Client {
@@ -144,28 +164,42 @@ impl Client {
         let http = HttpClient::builder()
             .user_agent(UA)
             .cookie_provider(cookie_store.clone())
+            .connect_timeout(Duration::from_secs(15))
+            // Per read, so large downloads still work; a stalled server cannot hang forever.
+            .read_timeout(Duration::from_secs(30))
             .build()
             .context("Failed to build HTTP client")?;
 
         Ok(Self {
             http,
             cookie_store,
+            block_path: cookie_path.with_file_name("relogin-blocked.json"),
             cookie_path,
             endpoints,
             session: tokio::sync::Mutex::new(Session {
                 csrf: None,
                 generation: 0,
-                relogin_error: None,
+                failure: None,
             }),
-            credentials: tokio::sync::Mutex::new(CredentialSlot::Unloaded),
+            credentials: tokio::sync::Mutex::new(CredentialSource::Saved),
             save_lock: std::sync::Mutex::new(()),
+            retry_pause: RELOGIN_RETRY_PAUSE,
+            login_timeout: LOGIN_TIMEOUT,
         })
     }
 
-    /// Uses `creds` for silent re-login instead of the saved credentials; `None` disables it.
+    /// Uses `creds` for silent re-login instead of the saved ones; `None` disables it.
     pub async fn set_credentials(&self, creds: Option<Credentials>) {
-        *self.credentials.lock().await = CredentialSlot::Loaded(creds);
-        self.session.lock().await.relogin_error = None;
+        let mut session = self.session.lock().await;
+        *self.credentials.lock().await = CredentialSource::Fixed(creds);
+        session.failure = None;
+    }
+
+    /// Goes back to reading the credential store whenever a re-login is needed.
+    pub async fn use_saved_credentials(&self) {
+        let mut session = self.session.lock().await;
+        *self.credentials.lock().await = CredentialSource::Saved;
+        session.failure = None;
     }
 
     /// Confirms that the session works, renewing it with saved credentials when it expired.
@@ -173,7 +207,7 @@ impl Client {
         let observed = self.session.lock().await.generation;
         match self.fetch_csrf().await? {
             Some(token) => {
-                self.install_csrf(token).await;
+                self.install_csrf(token, observed).await;
                 self.save_cookies()
             }
             None => self.renew_session(observed).await,
@@ -185,24 +219,30 @@ impl Client {
     /// Errors keep their cause (for example [`SsoFailure`]) for callers to inspect.
     pub async fn login_with(&self, creds: &Credentials) -> Result<()> {
         let mut session = self.session.lock().await;
-        let token = self.sso_login(creds).await?;
+        let token = self.timed_sso_login(creds).await?;
         session.csrf = Some(token);
         session.generation += 1;
-        session.relogin_error = None;
+        session.failure = None;
         drop(session);
+        self.clear_block();
         self.save_cookies()
     }
 
-    /// Ends the Learn session (best effort) and deletes the local session cookies.
+    /// Ends the Learn session (best effort), stops silent re-login, and deletes the
+    /// local session cookies.
     pub async fn logout(&self) -> Result<()> {
-        // thu-learn-lib logs out with a plain POST; failure only means the session was already gone.
-        let _ = self.http.post(self.endpoints.logout()).send().await;
-        self.cookie_store.lock().unwrap().clear();
         {
+            // Hold the session lock so no renewal can start until everything is cleared.
             let mut session = self.session.lock().await;
+            *self.credentials.lock().await = CredentialSource::Fixed(None);
             session.csrf = None;
             session.generation += 1;
+            session.failure = None;
+            // thu-learn-lib logs out with a plain POST; failure only means the session was already gone.
+            let _ = self.http.post(self.endpoints.logout()).send().await;
+            self.cookie_store.lock().unwrap().clear();
         }
+        self.clear_block();
         match std::fs::remove_file(&self.cookie_path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -244,19 +284,25 @@ impl Client {
             .get(self.endpoints.course_list_page())
             .send()
             .await
+            .map_err(reqwest::Error::without_url)
             .context("Failed to reach Tsinghua Learn")?
             .text()
-            .await?;
+            .await
+            .map_err(reqwest::Error::without_url)?;
         Ok(extract_csrf(&html))
     }
 
-    async fn install_csrf(&self, token: String) {
+    /// Installs a token read under `observed`, unless a newer session replaced it meanwhile.
+    async fn install_csrf(&self, token: String, observed: u64) {
         let mut session = self.session.lock().await;
+        if session.generation != observed {
+            return;
+        }
         if session.csrf.as_deref() != Some(token.as_str()) {
             session.csrf = Some(token);
             session.generation += 1;
         }
-        session.relogin_error = None;
+        session.failure = None;
     }
 
     /// Re-establishes the session after a request made under `observed` found it expired.
@@ -266,45 +312,114 @@ impl Client {
             // Another request already renewed the session while this one waited.
             return Ok(());
         }
-        if let Some(reason) = &session.relogin_error {
-            return Err(AuthError::ReloginFailed(reason.clone()).into());
+        if let Some(failure) = &session.failure {
+            if failure.at.elapsed() < self.retry_pause {
+                return Err(AuthError::ReloginFailed(failure.reason.clone()).into());
+            }
         }
-        let creds = match self.credentials().await {
+
+        let creds = match self.current_credentials().await {
             Ok(Some(creds)) => creds,
             Ok(None) => return Err(AuthError::SessionExpired.into()),
             Err(e) => {
                 let reason = format!("could not read saved credentials: {e:#}");
-                session.relogin_error = Some(reason.clone());
+                session.failure = Some(ReloginFailure {
+                    reason: reason.clone(),
+                    at: Instant::now(),
+                    definitive: false,
+                    digest: String::new(),
+                });
                 return Err(AuthError::ReloginFailed(reason).into());
             }
         };
-        match self.sso_login(&creds).await {
+        let digest = credentials_digest(&creds);
+
+        // Credentials Tsinghua already rejected (here or in another process) are not retried.
+        let known_rejection = match &session.failure {
+            Some(f) if f.definitive && f.digest == digest => Some(f.reason.clone()),
+            _ => self.blocked_reason(&digest),
+        };
+        if let Some(reason) = known_rejection {
+            session.failure = Some(ReloginFailure {
+                reason: reason.clone(),
+                at: Instant::now(),
+                definitive: true,
+                digest,
+            });
+            return Err(AuthError::ReloginFailed(reason).into());
+        }
+
+        match self.timed_sso_login(&creds).await {
             Ok(token) => {
                 session.csrf = Some(token);
                 session.generation += 1;
-                session.relogin_error = None;
+                session.failure = None;
                 drop(session);
+                self.clear_block();
                 self.save_cookies()
             }
             Err(e) => {
                 let reason = format!("{e:#}");
-                session.relogin_error = Some(reason.clone());
+                let definitive = is_definitive_rejection(&e);
+                // Wrong passwords and untrusted devices stay wrong for later processes too.
+                if matches!(
+                    e.downcast_ref::<SsoFailure>(),
+                    Some(SsoFailure::Rejected(_) | SsoFailure::NeedsTwoFactor)
+                ) {
+                    self.record_block(&digest, &reason);
+                }
+                session.failure = Some(ReloginFailure {
+                    reason: reason.clone(),
+                    at: Instant::now(),
+                    definitive,
+                    digest,
+                });
                 Err(AuthError::ReloginFailed(reason).into())
             }
         }
     }
 
-    async fn credentials(&self) -> Result<Option<Credentials>> {
-        let mut slot = self.credentials.lock().await;
-        if let CredentialSlot::Loaded(creds) = &*slot {
-            return Ok(creds.clone());
+    async fn current_credentials(&self) -> Result<Option<Credentials>> {
+        let source = self.credentials.lock().await;
+        match &*source {
+            CredentialSource::Fixed(creds) => Ok(creds.clone()),
+            CredentialSource::Saved => crate::credentials::load_async().await,
         }
-        let creds = crate::credentials::load_async().await?;
-        *slot = CredentialSlot::Loaded(creds.clone());
-        Ok(creds)
+    }
+
+    fn blocked_reason(&self, digest: &str) -> Option<String> {
+        let bytes = std::fs::read(&self.block_path).ok()?;
+        let block: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+        (block["digest"].as_str() == Some(digest)).then(|| {
+            block["reason"]
+                .as_str()
+                .unwrap_or("login rejected")
+                .to_string()
+        })
+    }
+
+    fn record_block(&self, digest: &str, reason: &str) {
+        let block = serde_json::json!({ "digest": digest, "reason": reason });
+        crate::paths::write_private(&self.block_path, block.to_string().as_bytes()).ok();
+    }
+
+    fn clear_block(&self) {
+        std::fs::remove_file(&self.block_path).ok();
+    }
+
+    async fn timed_sso_login(&self, creds: &Credentials) -> Result<String> {
+        match tokio::time::timeout(self.login_timeout, self.sso_login(creds)).await {
+            Ok(result) => result,
+            Err(_) => bail!(
+                "logging in to Tsinghua took longer than {} seconds",
+                self.login_timeout.as_secs()
+            ),
+        }
     }
 
     /// Logs in through `id.tsinghua.edu.cn` like thu-learn-lib and returns the new `_csrf`.
+    ///
+    /// Request URLs are stripped from errors because they can carry the ticket or `_csrf`.
     async fn sso_login(&self, creds: &Credentials) -> Result<String> {
         // Always start from the login form rather than an older ID session.
         self.forget_id_session();
@@ -314,8 +429,10 @@ impl Client {
             .get(self.endpoints.id_login_form())
             .send()
             .await
+            .map_err(reqwest::Error::without_url)
             .context("Failed to open the Tsinghua login page")?
             .error_for_status()
+            .map_err(reqwest::Error::without_url)
             .context("The Tsinghua login page returned an error")?;
         if Endpoints::same_origin(&self.endpoints.learn, form_page.url()) {
             // Already signed in to ID: the form redirected straight back to Learn.
@@ -323,7 +440,10 @@ impl Client {
                 return Ok(token);
             }
         }
-        let form_html = form_page.text().await?;
+        let form_html = form_page
+            .text()
+            .await
+            .map_err(reqwest::Error::without_url)?;
         let public_key = sso::parse_sm2_public_key(&form_html).ok_or(SsoFailure::NoPublicKey)?;
         let encrypted_password = sso::encrypt_password(&creds.password, &public_key)?;
 
@@ -341,10 +461,11 @@ impl Client {
             .multipart(form)
             .send()
             .await
+            .map_err(reqwest::Error::without_url)
             .context("Failed to submit the Tsinghua login form")?;
         let landed_on_learn = Endpoints::same_origin(&self.endpoints.learn, check.url());
         let check_url = check.url().to_string();
-        let check_html = check.text().await?;
+        let check_html = check.text().await.map_err(reqwest::Error::without_url)?;
 
         match sso::parse_ticket(&check_html) {
             Some(ticket) => {
@@ -353,6 +474,7 @@ impl Client {
                     .get(self.endpoints.roaming(&ticket)?)
                     .send()
                     .await
+                    .map_err(reqwest::Error::without_url)
                     .context("Failed to open Learn with the login ticket")?;
                 if !roam.status().is_success() {
                     bail!("Learn rejected the login ticket (HTTP {})", roam.status());
@@ -413,7 +535,10 @@ impl Client {
     /// Sends an authenticated request built for a `_csrf` token, re-logging in once when needed.
     async fn send_authed(&self, build: impl Fn(&str) -> RequestBuilder) -> Result<Response> {
         let (token, generation) = self.session_token().await?;
-        let resp = build(&token).send().await?;
+        let resp = build(&token)
+            .send()
+            .await
+            .map_err(reqwest::Error::without_url)?;
         if !self.login_required(&resp) {
             self.save_cookies()?;
             return Ok(resp);
@@ -421,12 +546,15 @@ impl Client {
 
         self.renew_session(generation).await?;
         let (token, _) = self.session_token().await?;
-        let resp = build(&token).send().await?;
+        let resp = build(&token)
+            .send()
+            .await
+            .map_err(reqwest::Error::without_url)?;
         if self.login_required(&resp) {
             bail!(
                 "Learn rejected the request even after logging in again (HTTP {}, {})",
                 resp.status(),
-                resp.url()
+                resp.url().path()
             );
         }
         self.save_cookies()?;
@@ -438,7 +566,7 @@ impl Client {
         let resp = self
             .send_authed(|csrf| self.http.get(url).query(&[("_csrf", csrf)]))
             .await?;
-        let text = resp.text().await?;
+        let text = resp.text().await.map_err(reqwest::Error::without_url)?;
         serde_json::from_str(&text).with_context(|| {
             format!(
                 "Failed to parse JSON; first 200 response chars: {}",
@@ -452,7 +580,7 @@ impl Client {
         let resp = self
             .send_authed(|csrf| self.http.get(url).query(&[("_csrf", csrf)]))
             .await?;
-        Ok(resp.text().await?)
+        Ok(resp.text().await.map_err(reqwest::Error::without_url)?)
     }
 
     /// Sends a multipart POST with `_csrf` and parses the response as JSON.
@@ -471,7 +599,7 @@ impl Client {
                     .multipart(form())
             })
             .await?;
-        let text = resp.text().await?;
+        let text = resp.text().await.map_err(reqwest::Error::without_url)?;
         serde_json::from_str(&text).with_context(|| {
             format!(
                 "Failed to parse JSON; first 200 response chars: {}",
@@ -485,8 +613,9 @@ impl Client {
         let resp = self
             .send_authed(|csrf| self.http.get(url).query(&[("_csrf", csrf)]))
             .await?
-            .error_for_status()?;
-        let bytes = resp.bytes().await?;
+            .error_for_status()
+            .map_err(reqwest::Error::without_url)?;
+        let bytes = resp.bytes().await.map_err(reqwest::Error::without_url)?;
         if let Some(parent) = dest.parent() {
             tokio::fs::create_dir_all(parent).await.ok();
         }
@@ -499,10 +628,15 @@ impl Client {
         let resp = self
             .send_authed(|csrf| self.http.get(url).query(&[("_csrf", csrf)]))
             .await?
-            .error_for_status()?;
+            .error_for_status()
+            .map_err(reqwest::Error::without_url)?;
         let cd = resp.headers().get(reqwest::header::CONTENT_DISPOSITION);
         let name = cd.and_then(|v| filename_from_content_disposition(v.as_bytes()));
-        let bytes = resp.bytes().await?.to_vec();
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(reqwest::Error::without_url)?
+            .to_vec();
         Ok((bytes, name))
     }
 
@@ -521,6 +655,32 @@ impl Client {
         crate::paths::write_private(&self.cookie_path, &buf)
             .with_context(|| format!("Failed to write {}", self.cookie_path.display()))
     }
+
+    #[cfg(test)]
+    pub(crate) fn with_timing(mut self, retry_pause: Duration, login_timeout: Duration) -> Self {
+        self.retry_pause = retry_pause;
+        self.login_timeout = login_timeout;
+        self
+    }
+}
+
+/// Failures that mean Tsinghua looked at the credentials and said no.
+pub(crate) fn is_definitive_rejection(e: &anyhow::Error) -> bool {
+    matches!(
+        e.downcast_ref::<SsoFailure>(),
+        Some(SsoFailure::Rejected(_) | SsoFailure::NeedsTwoFactor | SsoFailure::NoTicket)
+    )
+}
+
+/// Identifies a credential set without storing anything reversible.
+fn credentials_digest(creds: &Credentials) -> String {
+    use sm3::{Digest, Sm3};
+    let mut hasher = Sm3::new();
+    for part in [&creds.username, &creds.password, &creds.fingerprint] {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part.as_bytes());
+    }
+    sso::to_hex(&hasher.finalize())
 }
 
 #[allow(deprecated)]
@@ -609,6 +769,7 @@ mod tests {
     use crate::sso::SsoFailure;
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     fn temp_cookie_path(tag: &str) -> PathBuf {
         std::env::temp_dir()
@@ -620,9 +781,20 @@ mod tests {
     }
 
     async fn client_for(mock: &MockSso, tag: &str) -> Client {
+        client_with_timing(mock, tag, Duration::from_secs(30), Duration::from_secs(10)).await
+    }
+
+    async fn client_with_timing(
+        mock: &MockSso,
+        tag: &str,
+        retry_pause: Duration,
+        login_timeout: Duration,
+    ) -> Client {
         let path = temp_cookie_path(tag);
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
-        let client = Client::with_endpoints(path, mock.endpoints.clone()).unwrap();
+        let client = Client::with_endpoints(path, mock.endpoints.clone())
+            .unwrap()
+            .with_timing(retry_pause, login_timeout);
         client.set_credentials(Some(mock.credentials())).await;
         client
     }
@@ -778,14 +950,82 @@ mod tests {
         assert!(path.exists());
 
         client.logout().await.unwrap();
-        client.set_credentials(None).await;
 
+        // Logout alone must stop silent re-login, even though credentials were set.
         assert!(!path.exists());
         let err = client.get_json(&json_url(&mock)).await.unwrap_err();
         assert_eq!(
             err.downcast_ref::<AuthError>(),
             Some(&AuthError::SessionExpired)
         );
+        assert_eq!(mock.sso_logins(), 1);
+        assert!(!path.exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn transient_failures_are_retried_after_a_pause() {
+        let mock = MockSso::start().await;
+        let pause = Duration::from_millis(300);
+        let client = client_with_timing(&mock, "transient", pause, Duration::from_secs(5)).await;
+        mock.state.lock().unwrap().fail_forms = 1;
+
+        let err = client.get_json(&json_url(&mock)).await.unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<AuthError>(),
+            Some(AuthError::ReloginFailed(r)) if r.contains("503")
+        ));
+        // Within the pause, the failure is shared without contacting ID again.
+        let requests = mock.form_requests();
+        assert!(client.get_json(&json_url(&mock)).await.is_err());
+        assert_eq!(mock.form_requests(), requests);
+
+        tokio::time::sleep(pause + Duration::from_millis(50)).await;
+        assert_eq!(client.get_json(&json_url(&mock)).await.unwrap()["ok"], true);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rejected_credentials_are_not_retried_by_later_processes() {
+        let mock = MockSso::start().await;
+        let mut stale = mock.credentials();
+        stale.password = "old password".into();
+        let first =
+            client_with_timing(&mock, "blocked", Duration::ZERO, Duration::from_secs(5)).await;
+        first.set_credentials(Some(stale.clone())).await;
+        assert!(first.get_json(&json_url(&mock)).await.is_err());
+        assert!(first.get_json(&json_url(&mock)).await.is_err());
+        assert_eq!(mock.check_attempts(), 1);
+
+        // The next command, with the same stale credentials, does not try again.
+        let second = Client::with_endpoints(temp_cookie_path("blocked"), mock.endpoints.clone())
+            .unwrap()
+            .with_timing(Duration::ZERO, Duration::from_secs(5));
+        second.set_credentials(Some(stale)).await;
+        let err = second.get_json(&json_url(&mock)).await.unwrap_err();
+        assert!(err.to_string().contains("rejected"));
+        assert_eq!(mock.check_attempts(), 1);
+
+        // A new password is tried.
+        second.set_credentials(Some(mock.credentials())).await;
+        assert_eq!(second.get_json(&json_url(&mock)).await.unwrap()["ok"], true);
+        assert_eq!(mock.check_attempts(), 2);
+        std::fs::remove_dir_all(temp_cookie_path("blocked").parent().unwrap()).ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stalled_login_times_out_and_is_retried_later() {
+        let mock = MockSso::start().await;
+        let pause = Duration::from_millis(100);
+        let client = client_with_timing(&mock, "stall", pause, Duration::from_millis(300)).await;
+        mock.state.lock().unwrap().form_delay = Duration::from_secs(5);
+
+        let started = Instant::now();
+        let err = client.get_json(&json_url(&mock)).await.unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(err.to_string().contains("took longer"));
+
+        mock.state.lock().unwrap().form_delay = Duration::ZERO;
+        tokio::time::sleep(pause + Duration::from_millis(50)).await;
+        assert_eq!(client.get_json(&json_url(&mock)).await.unwrap()["ok"], true);
     }
 
     #[test]

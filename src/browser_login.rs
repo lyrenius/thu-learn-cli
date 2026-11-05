@@ -15,7 +15,8 @@
 //! local Google Chrome installation is still required.
 
 use anyhow::{Context, Result};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use thirtyfour::error::WebDriverErrorInner;
 use thirtyfour::prelude::*;
 use tokio::sync::mpsc;
 
@@ -23,6 +24,11 @@ use tokio::sync::mpsc;
 const LEARN_HOME: &str = "https://learn.tsinghua.edu.cn/f/wlxt/index/course/student/";
 /// Unified authentication host.
 const AUTH_HOST: &str = "id.tsinghua.edu.cn";
+/// The only origin the injected script acts on (https only).
+const AUTH_ORIGIN: &str = "https://id.tsinghua.edu.cn";
+/// Cookie in which the injected script also leaves its record, so it can be read
+/// even when the login check redirects straight to Learn.
+const RECORD_COOKIE: &str = "thu_learn_cli_sso";
 /// Learn host reached after successful login.
 const LEARN_HOST: &str = "learn.tsinghua.edu.cn";
 
@@ -58,9 +64,23 @@ pub struct SsoInjection {
     pub device_name: String,
 }
 
+/// How waiting for the browser login ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowserEnd {
+    /// Chrome reached Learn after unified authentication.
+    ReachedLearn,
+    /// The user pressed Enter before Learn was reached.
+    Confirmed,
+    /// The Chrome window or driver went away.
+    Closed,
+    /// Nothing happened before the time limit.
+    TimedOut,
+}
+
 /// What a browser login produced.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct BrowserLogin {
+    pub end: BrowserEnd,
     pub cookies: Vec<RawCookie>,
     /// `fingerGenPrint` from the login form, when observed.
     pub finger_gen_print: String,
@@ -72,12 +92,46 @@ pub struct BrowserLogin {
     pub device_trusted: bool,
 }
 
+impl BrowserEnd {
+    /// Why a login that did not reach Learn stopped.
+    pub fn describe(self) -> &'static str {
+        match self {
+            BrowserEnd::ReachedLearn => "Learn was reached",
+            BrowserEnd::Confirmed => "Enter was pressed before Learn loaded",
+            BrowserEnd::Closed => "Chrome was closed before the login reached Learn",
+            BrowserEnd::TimedOut => "the login did not reach Learn within 5 minutes",
+        }
+    }
+}
+
+impl BrowserLogin {
+    fn new() -> Self {
+        Self {
+            end: BrowserEnd::Closed,
+            cookies: Vec::new(),
+            finger_gen_print: String::new(),
+            finger_gen_print3: String::new(),
+            fingerprint_submitted: false,
+            device_trusted: false,
+        }
+    }
+
+    /// Whether the login actually finished on Learn.
+    pub fn reached_learn(&self) -> bool {
+        self.end == BrowserEnd::ReachedLearn
+    }
+}
+
 /// Opens Chrome, waits for login, and returns captured session cookies.
 ///
 /// Nothing is injected, so this only yields a browser session that expires as usual.
 pub async fn login_via_browser() -> Result<Vec<RawCookie>> {
     let progress = |msg: &str| eprintln!("{msg}");
-    Ok(run(None, stdin_enter_signal(), &progress).await?.cookies)
+    let login = run(None, stdin_enter_signal(), &progress).await?;
+    if !login.reached_learn() {
+        anyhow::bail!("Login did not complete: {}.", login.end.describe());
+    }
+    Ok(login.cookies)
 }
 
 /// Turns the next line typed on stdin into a "continue" signal for [`run`].
@@ -103,7 +157,10 @@ pub async fn run(
     manual_continue: mpsc::Receiver<()>,
     progress: &(dyn Fn(&str) + Sync),
 ) -> Result<BrowserLogin> {
-    let caps = DesiredCapabilities::chrome();
+    let mut caps = DesiredCapabilities::chrome();
+    // Leave JavaScript dialogs (captcha errors, "code sent" notices) for the user instead of
+    // letting WebDriver dismiss them while the login is being polled.
+    caps.set("unhandledPromptBehavior", "ignore")?;
     // managed resolves, downloads, starts, and later cleans up chromedriver.
     let driver = WebDriver::managed(caps)
         .await
@@ -161,7 +218,8 @@ async fn drive(
 /// Builds the injected script with its configuration embedded as a JSON literal.
 fn injection_script(injection: &SsoInjection, storage_key: &str) -> String {
     let config = serde_json::json!({
-        "idHost": AUTH_HOST,
+        "idOrigin": AUTH_ORIGIN,
+        "recordCookie": RECORD_COOKIE,
         "username": injection.username,
         "password": injection.password,
         "fingerprint": injection.fingerprint,
@@ -178,23 +236,25 @@ async fn wait_for_login(
     storage_key: Option<&str>,
     mut manual_continue: mpsc::Receiver<()>,
 ) -> BrowserLogin {
-    let mut outcome = BrowserLogin::default();
+    let mut outcome = BrowserLogin::new();
     let mut seen_auth = false;
-    let mut waited = 0u64;
+    let deadline = Instant::now() + Duration::from_millis(MAX_WAIT_MS);
 
     loop {
         tokio::select! {
-            // Manual Enter fallback.
+            // Manual Enter fallback; it only counts as finished when Chrome shows Learn.
             Some(()) = manual_continue.recv() => {
-                outcome.cookies = capture_cookies(driver).await;
-                return outcome;
+                let on_learn = matches!(
+                    driver.current_url().await,
+                    Ok(u) if u.host_str() == Some(LEARN_HOST)
+                );
+                let end = if on_learn { BrowserEnd::ReachedLearn } else { BrowserEnd::Confirmed };
+                return finish(driver, outcome, end).await;
             }
             // Poll the current URL periodically.
             _ = tokio::time::sleep(Duration::from_millis(POLL_INTERVAL_MS)) => {
-                waited += POLL_INTERVAL_MS;
                 match driver.current_url().await {
                     Ok(u) => {
-                        let s = u.as_str();
                         if u.host_str() == Some(AUTH_HOST) {
                             // The flow really reached the authentication page.
                             seen_auth = true;
@@ -203,32 +263,72 @@ async fn wait_for_login(
                                     merge_capture(&mut outcome, ret.json());
                                 }
                             }
-                        } else if seen_auth && s.contains(LEARN_HOST) {
+                        } else if seen_auth && u.host_str() == Some(LEARN_HOST) {
                             // After returning to Learn, wait briefly for cookies to settle.
                             tokio::time::sleep(Duration::from_millis(800)).await;
-                            let cs = capture_cookies(driver).await;
-                            if !cs.is_empty() {
-                                outcome.cookies = cs;
-                                return outcome;
-                            }
+                            return finish(driver, outcome, BrowserEnd::ReachedLearn).await;
                         }
                     }
-                    Err(_) => {
-                        // The browser may have been closed manually.
-                        outcome.cookies = capture_cookies(driver).await;
-                        return outcome;
+                    Err(e) if browser_gone(&e) => {
+                        return finish(driver, outcome, BrowserEnd::Closed).await;
                     }
+                    // A dialog is open or a page is loading; keep waiting.
+                    Err(_) => {}
                 }
-                if waited >= MAX_WAIT_MS {
-                    outcome.cookies = capture_cookies(driver).await;
-                    return outcome;
+                if Instant::now() >= deadline {
+                    return finish(driver, outcome, BrowserEnd::TimedOut).await;
                 }
             }
         }
     }
 }
 
-/// Merges one [`CAPTURE_JS`] result; values recorded at submit time win over live ones.
+/// Whether a WebDriver error means the window or the driver is gone, rather than a
+/// dialog or a page that is still loading.
+fn browser_gone(e: &WebDriverError) -> bool {
+    matches!(
+        &**e,
+        WebDriverErrorInner::NoSuchWindow(_)
+            | WebDriverErrorInner::InvalidSessionId(_)
+            | WebDriverErrorInner::SessionNotCreated(_)
+            | WebDriverErrorInner::RequestFailed(_)
+            | WebDriverErrorInner::HttpError(_)
+            | WebDriverErrorInner::IoError(_)
+            | WebDriverErrorInner::CommandSendError(_)
+            | WebDriverErrorInner::CommandRecvError(_)
+            | WebDriverErrorInner::FatalError(_)
+    )
+}
+
+/// Captures cookies, reads the injected script's cookie record, and records how the wait ended.
+async fn finish(driver: &WebDriver, mut outcome: BrowserLogin, end: BrowserEnd) -> BrowserLogin {
+    let mut cookies = capture_cookies(driver).await;
+    if let Some(record) = cookies
+        .iter()
+        .rev()
+        .find(|(name, ..)| name == RECORD_COOKIE)
+        .and_then(|(_, value, ..)| decode_record_cookie(value))
+    {
+        merge_capture(&mut outcome, &serde_json::json!({ "saved": record }));
+    }
+    // The record is only for the CLI; it is not part of any session.
+    cookies.retain(|(name, ..)| name != RECORD_COOKIE);
+    outcome.cookies = cookies;
+    outcome.end = end;
+    outcome
+}
+
+/// Decodes the `encodeURIComponent(JSON.stringify(record))` cookie value.
+fn decode_record_cookie(value: &str) -> Option<serde_json::Value> {
+    // encodeURIComponent never emits a bare `+`, so form decoding is plain percent decoding here.
+    let decoded = url::form_urlencoded::parse(format!("v={value}").as_bytes())
+        .next()
+        .map(|(_, v)| v.into_owned())?;
+    serde_json::from_str(&decoded).ok()
+}
+
+/// Merges one [`CAPTURE_JS`] result; values recorded at submit time win over live ones,
+/// and the latest live value is kept while nothing was recorded.
 fn merge_capture(outcome: &mut BrowserLogin, value: &serde_json::Value) {
     let text = |v: &serde_json::Value| v.as_str().unwrap_or_default().to_string();
     let saved = &value["saved"];
@@ -254,7 +354,7 @@ fn merge_capture(outcome: &mut BrowserLogin, value: &serde_json::Value) {
         let live_value = text(&value[live_key]);
         if !saved_value.is_empty() {
             *target = saved_value;
-        } else if !live_value.is_empty() && !outcome.fingerprint_submitted {
+        } else if !live_value.is_empty() {
             *target = live_value;
         }
     }
@@ -364,7 +464,8 @@ mod tests {
         assert_eq!(config["username"], inj.username.as_str());
         assert_eq!(config["fingerprint"], inj.fingerprint.as_str());
         assert_eq!(config["deviceName"], inj.device_name.as_str());
-        assert_eq!(config["idHost"], "id.tsinghua.edu.cn");
+        assert_eq!(config["idOrigin"], "https://id.tsinghua.edu.cn");
+        assert_eq!(config["recordCookie"], "thu_learn_cli_sso");
         assert_eq!(config["storageKey"], "thu-learn-cli-sso-key");
         // The raw password never appears unquoted in the script.
         assert!(!script.contains("a'b\"c"));
@@ -372,7 +473,7 @@ mod tests {
 
     #[test]
     fn capture_prefers_values_recorded_at_submit_time() {
-        let mut outcome = BrowserLogin::default();
+        let mut outcome = BrowserLogin::new();
         merge_capture(
             &mut outcome,
             &serde_json::json!({"saved": {}, "fingerGenPrint": "live1", "fingerGenPrint3": ""}),
@@ -399,5 +500,27 @@ mod tests {
             &serde_json::json!({"saved": {"submitted": true}}),
         );
         assert_eq!(outcome.finger_gen_print, "sub1");
+    }
+
+    #[test]
+    fn live_values_fill_in_when_the_record_has_none() {
+        let mut outcome = BrowserLogin::new();
+        merge_capture(
+            &mut outcome,
+            &serde_json::json!({"saved": {"submitted": true, "fingerGenPrint": ""},
+                                "fingerGenPrint": "GEN1", "fingerGenPrint3": "GEN3"}),
+        );
+        assert_eq!(outcome.finger_gen_print, "GEN1");
+        assert_eq!(outcome.finger_gen_print3, "GEN3");
+    }
+
+    #[test]
+    fn record_cookie_is_decoded() {
+        // encodeURIComponent(JSON.stringify({submitted: true, fingerGenPrint: "a b+c"}))
+        let value = "%7B%22submitted%22%3Atrue%2C%22fingerGenPrint%22%3A%22a%20b%2Bc%22%7D";
+        let record = decode_record_cookie(value).unwrap();
+        assert_eq!(record["submitted"], true);
+        assert_eq!(record["fingerGenPrint"], "a b+c");
+        assert!(decode_record_cookie("not-json").is_none());
     }
 }

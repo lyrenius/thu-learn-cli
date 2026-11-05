@@ -3,8 +3,9 @@
 //! Like learnX (which keeps them in the iOS Keychain / Android Keystore through
 //! expo-secure-store), the CLI stores the username, password, and the trusted
 //! device fingerprint in the operating system credential store: macOS Keychain,
-//! Windows Credential Manager, or the freedesktop Secret Service on Linux. When
-//! no credential store is available, it falls back to an owner-only JSON file.
+//! Windows Credential Manager, or the freedesktop Secret Service on Linux. Only
+//! when no credential store exists at all does it fall back to an owner-only
+//! JSON file; a locked or denied store is reported instead.
 //!
 //! Set `THU_LEARN_CREDENTIAL_STORE=file` to always use the file, or `keyring` to
 //! require the system credential store.
@@ -51,15 +52,18 @@ impl std::fmt::Debug for Credentials {
 pub enum Location {
     /// The operating system credential store.
     Keyring,
-    /// The owner-only fallback file.
-    File(PathBuf),
+    /// The owner-only file; `fallback_reason` explains why the keyring was not used.
+    File {
+        path: PathBuf,
+        fallback_reason: Option<String>,
+    },
 }
 
 impl std::fmt::Display for Location {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Location::Keyring => f.write_str(keyring_name()),
-            Location::File(path) => write!(f, "{}", path.display()),
+            Location::File { path, .. } => write!(f, "{}", path.display()),
         }
     }
 }
@@ -82,13 +86,22 @@ enum Mode {
 fn mode() -> Result<Mode> {
     match std::env::var(STORE_ENV) {
         Err(_) => Ok(Mode::Auto),
-        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
-            "" | "auto" => Ok(Mode::Auto),
-            "keyring" | "keychain" => Ok(Mode::Keyring),
-            "file" => Ok(Mode::File),
-            other => bail!("{STORE_ENV} must be `auto`, `keyring`, or `file`, not `{other}`"),
-        },
+        Ok(v) => parse_mode(&v),
     }
+}
+
+fn parse_mode(v: &str) -> Result<Mode> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "" | "auto" => Ok(Mode::Auto),
+        "keyring" | "keychain" => Ok(Mode::Keyring),
+        "file" => Ok(Mode::File),
+        other => bail!("{STORE_ENV} must be `auto`, `keyring`, or `file`, not `{other}`"),
+    }
+}
+
+/// Fails early when `THU_LEARN_CREDENTIAL_STORE` has an invalid value.
+pub fn check_config() -> Result<()> {
+    mode().map(|_| ())
 }
 
 /// Loads saved credentials, preferring the system credential store.
@@ -96,11 +109,15 @@ pub fn load() -> Result<Option<Credentials>> {
     let file = paths::credentials_path();
     match mode()? {
         Mode::File => load_file(&file),
-        Mode::Keyring => keyring_load(),
+        Mode::Keyring => keyring_load().map_err(|e| e.into_anyhow("read")),
         Mode::Auto => match keyring_load() {
             Ok(Some(creds)) => Ok(Some(creds)),
-            // Not in the keyring, or no usable keyring: try the fallback file.
-            Ok(None) | Err(_) => load_file(&file),
+            Ok(None) | Err(KeyringError::Unavailable(_)) => load_file(&file),
+            // A locked or denied keyring: use a fallback file if one exists, otherwise report it.
+            Err(e) => match load_file(&file)? {
+                Some(creds) => Ok(Some(creds)),
+                None => Err(e.into_anyhow("read")),
+            },
         },
     }
 }
@@ -111,10 +128,15 @@ pub fn save(creds: &Credentials) -> Result<Location> {
     match mode()? {
         Mode::File => {
             save_file(&file, creds)?;
-            Ok(Location::File(file))
+            // Never keep a second, possibly stale copy in the keyring.
+            let _ = keyring_delete();
+            Ok(Location::File {
+                path: file,
+                fallback_reason: None,
+            })
         }
         Mode::Keyring => {
-            keyring_save(creds)?;
+            keyring_save(creds).map_err(|e| e.into_anyhow("write"))?;
             remove_file(&file)?;
             Ok(Location::Keyring)
         }
@@ -124,28 +146,34 @@ pub fn save(creds: &Credentials) -> Result<Location> {
                 remove_file(&file)?;
                 Ok(Location::Keyring)
             }
-            Err(_) => {
+            Err(KeyringError::Unavailable(reason)) => {
                 save_file(&file, creds)?;
-                Ok(Location::File(file))
+                Ok(Location::File {
+                    path: file,
+                    fallback_reason: Some(reason),
+                })
             }
+            Err(e) => Err(e.into_anyhow("write")),
         },
     }
 }
 
 /// Deletes credentials from every location; returns whether anything was removed.
+///
+/// The file is removed first. A keyring entry that cannot be removed is an error,
+/// so callers never report credentials as deleted while a copy remains.
 pub fn delete() -> Result<bool> {
     let mut removed = false;
-    if mode()? != Mode::File {
-        match keyring_delete() {
-            Ok(r) => removed |= r,
-            Err(e) if mode()? == Mode::Keyring => return Err(e),
-            Err(_) => {}
-        }
-    }
     let file = paths::credentials_path();
     if file.exists() {
         remove_file(&file)?;
         removed = true;
+    }
+    match keyring_delete() {
+        Ok(r) => removed |= r,
+        // No credential store on this machine means nothing can be stored there.
+        Err(KeyringError::Unavailable(_)) => {}
+        Err(e) => return Err(e.into_anyhow("delete from")),
     }
     Ok(removed)
 }
@@ -157,35 +185,67 @@ pub async fn load_async() -> Result<Option<Credentials>> {
         .map_err(|e| anyhow!("Credential loading task failed: {e}"))?
 }
 
-fn keyring_entry() -> Result<keyring::Entry> {
-    keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)
-        .map_err(|e| anyhow!("System credential store is unavailable: {e}"))
+/// Keyring failures, split by what the CLI should do about them.
+#[derive(Debug)]
+enum KeyringError {
+    /// No usable credential store on this machine (none installed, no session bus, ...).
+    Unavailable(String),
+    /// The store exists but is locked, or access was denied.
+    Denied(String),
+    Other(String),
 }
 
-fn keyring_load() -> Result<Option<Credentials>> {
-    match keyring_entry()?.get_password() {
-        Ok(json) => Ok(Some(
-            serde_json::from_str(&json).context("Saved credentials in the keyring are corrupt")?,
-        )),
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(anyhow!("Failed to read the system credential store: {e}")),
+impl KeyringError {
+    fn classify(e: keyring::Error) -> Self {
+        match e {
+            keyring::Error::NoDefaultStore | keyring::Error::PlatformFailure(_) => {
+                KeyringError::Unavailable(e.to_string())
+            }
+            keyring::Error::NoStorageAccess(_) => KeyringError::Denied(e.to_string()),
+            other => KeyringError::Other(other.to_string()),
+        }
+    }
+
+    fn into_anyhow(self, action: &str) -> anyhow::Error {
+        match self {
+            KeyringError::Unavailable(e) | KeyringError::Other(e) => {
+                anyhow!("Failed to {action} {}: {e}", keyring_name())
+            }
+            KeyringError::Denied(e) => anyhow!(
+                "Could not {action} {} because it is locked or access was denied ({e}). \
+                 Unlock it and try again, or set {STORE_ENV}=file to use an owner-only file.",
+                keyring_name()
+            ),
+        }
     }
 }
 
-fn keyring_save(creds: &Credentials) -> Result<()> {
-    let json = serde_json::to_string(creds)?;
-    keyring_entry()?
-        .set_password(&json)
-        .map_err(|e| anyhow!("Failed to write the system credential store: {e}"))
+fn keyring_entry() -> std::result::Result<keyring::Entry, KeyringError> {
+    keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT).map_err(KeyringError::classify)
 }
 
-fn keyring_delete() -> Result<bool> {
+fn keyring_load() -> std::result::Result<Option<Credentials>, KeyringError> {
+    match keyring_entry()?.get_password() {
+        Ok(json) => serde_json::from_str(&json).map(Some).map_err(|_| {
+            KeyringError::Other("the saved credentials in the keyring are corrupt".into())
+        }),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(KeyringError::classify(e)),
+    }
+}
+
+fn keyring_save(creds: &Credentials) -> std::result::Result<(), KeyringError> {
+    let json = serde_json::to_string(creds).map_err(|e| KeyringError::Other(e.to_string()))?;
+    keyring_entry()?
+        .set_password(&json)
+        .map_err(KeyringError::classify)
+}
+
+fn keyring_delete() -> std::result::Result<bool, KeyringError> {
     match keyring_entry()?.delete_credential() {
         Ok(()) => Ok(true),
         Err(keyring::Error::NoEntry) => Ok(false),
-        Err(e) => Err(anyhow!(
-            "Failed to delete from the system credential store: {e}"
-        )),
+        Err(e) => Err(KeyringError::classify(e)),
     }
 }
 
@@ -264,5 +324,32 @@ mod tests {
         let creds: Credentials = serde_json::from_str(json).unwrap();
         assert_eq!(creds.finger_gen_print, "");
         assert_eq!(creds.finger_gen_print3, "");
+    }
+
+    #[test]
+    fn store_mode_values_are_validated() {
+        assert_eq!(parse_mode("").unwrap(), Mode::Auto);
+        assert_eq!(parse_mode(" File ").unwrap(), Mode::File);
+        assert_eq!(parse_mode("keychain").unwrap(), Mode::Keyring);
+        let err = parse_mode("keychian").unwrap_err().to_string();
+        assert!(err.contains("THU_LEARN_CREDENTIAL_STORE"));
+    }
+
+    #[test]
+    fn only_missing_stores_allow_the_file_fallback() {
+        assert!(matches!(
+            KeyringError::classify(keyring::Error::NoDefaultStore),
+            KeyringError::Unavailable(_)
+        ));
+        assert!(matches!(
+            KeyringError::classify(keyring::Error::NoStorageAccess(Box::new(
+                std::io::Error::other("locked")
+            ))),
+            KeyringError::Denied(_)
+        ));
+        let msg = KeyringError::Denied("locked".into())
+            .into_anyhow("write")
+            .to_string();
+        assert!(msg.contains("THU_LEARN_CREDENTIAL_STORE=file"));
     }
 }

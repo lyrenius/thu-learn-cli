@@ -39,13 +39,15 @@ Learn sessions live on the server and expire after a period of inactivity, so sa
 2. The username, password, and that device ID are saved in the system credential store.
 3. When a request finds the session expired (Learn redirects to `login_timeout` or answers HTTP 403), the CLI logs in to `id.tsinghua.edu.cn` again over HTTP. The password is SM2-encrypted exactly like the official login form does it. The CLI then opens Learn with the returned ticket and retries the request. Because the device ID is trusted, no two-factor prompt is needed.
 
-You only need to run `thu-learn login` again if your password changes, or if Tsinghua stops trusting the device (for example, after you remove it from your account). The next `thu-learn login` reuses the saved device ID, so it usually succeeds without opening Chrome.
+You only need to run `thu-learn login` again if your password changes, or if Tsinghua stops trusting the device (for example, after you remove it from your account). The next `thu-learn login` reuses the saved device ID, so it usually succeeds without opening Chrome; use `thu-learn login --browser` to go through Chrome anyway, for example when Tsinghua asks for a captcha.
+
+Failed logins are not repeated blindly, because repeated failures can make Tsinghua require a captcha. A network problem is retried after 30 seconds. Credentials that Tsinghua rejects (wrong password, or the device is no longer trusted) are not tried again, not even by later commands, until the next successful `thu-learn login`. This is recorded in `~/.config/thu-learn-cli/relogin-blocked.json`, which holds only a hash of the rejected credentials.
 
 ### Storage and options
 
-* Credentials are stored in the macOS Keychain, Windows Credential Manager, or the Secret Service keyring on Linux. If none is available, they go to `~/.config/thu-learn-cli/credentials.json`, which only your user can read. Set `THU_LEARN_CREDENTIAL_STORE=file` to always use the file, or `keyring` to require the system store.
+* Credentials are stored in the macOS Keychain, Windows Credential Manager, or the Secret Service keyring on Linux. Only if no such store exists (for example, a headless Linux machine) do they go to `~/.config/thu-learn-cli/credentials.json`, which only your user can read. A locked keyring, or a denied access prompt, is reported as an error instead. Set `THU_LEARN_CREDENTIAL_STORE=file` to always use the file, or `keyring` to require the system store.
 * `thu-learn login --no-remember` keeps the old behavior: only browser cookies are saved, no password is stored, and any previously saved credentials are removed.
-* `thu-learn logout` ends the Learn session and deletes saved credentials, cookies, and cache. Tsinghua may keep listing the device as trusted until you remove it from your account.
+* `thu-learn logout` ends the Learn session and deletes saved credentials (from the keyring and the fallback file), cookies, and cache. If any copy cannot be removed, it says so and exits with an error. Tsinghua may keep listing the device as trusted until you remove it from your account.
 
 Requirements and storage behavior:
 

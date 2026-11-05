@@ -452,6 +452,10 @@ enum Commands {
         /// Only keep this browser session; do not save (and forget any saved) credentials.
         #[arg(long)]
         no_remember: bool,
+        /// Log in through Chrome even if this device is already trusted (for example when
+        /// Tsinghua asks for a captcha).
+        #[arg(long, conflicts_with = "no_remember")]
+        browser: bool,
     },
     /// Log out and delete saved credentials, session cookies, and cache.
     Logout,
@@ -537,11 +541,12 @@ pub async fn run() -> Result<()> {
         Commands::Login {
             username,
             no_remember,
+            browser,
         } => {
             if no_remember {
                 cmd_login_session_only().await
             } else {
-                cmd_login(username).await
+                cmd_login(username, browser).await
             }
         }
         Commands::Logout => cmd_logout().await,
@@ -593,7 +598,9 @@ async fn prepare() -> Result<(Client, Vec<Course>)> {
 
 // ---------- Commands ----------
 
-async fn cmd_login(username: Option<String>) -> Result<()> {
+async fn cmd_login(username: Option<String>, force_browser: bool) -> Result<()> {
+    // Report a mistyped THU_LEARN_CREDENTIAL_STORE before asking for anything.
+    crate::credentials::check_config()?;
     let client = Client::new(paths::cookie_path())?;
     // A broken credential store should not block logging in again.
     let saved = crate::credentials::load_async().await.unwrap_or_else(|e| {
@@ -607,7 +614,8 @@ async fn cmd_login(username: Option<String>) -> Result<()> {
     if username.is_empty() {
         anyhow::bail!("A Tsinghua username is required.");
     }
-    let password = rpassword::prompt_password("Password: ").context("Failed to read password")?;
+    let password = rpassword::prompt_password("Password: ")
+        .context("Failed to read the password (`thu-learn login` needs an interactive terminal)")?;
     if password.is_empty() {
         anyhow::bail!("A password is required.");
     }
@@ -618,6 +626,7 @@ async fn cmd_login(username: Option<String>) -> Result<()> {
         username,
         password,
         saved.as_ref(),
+        force_browser,
         browser_login::stdin_enter_signal,
         &progress,
     )
@@ -630,15 +639,25 @@ async fn cmd_login(username: Option<String>) -> Result<()> {
             println!(
                 "   When the Learn session expires, thu-learn logs in again automatically; run `thu-learn logout` to remove them."
             );
-            if let crate::credentials::Location::File(_) = location {
+            if let crate::credentials::Location::File {
+                fallback_reason: Some(reason),
+                ..
+            } = &location
+            {
                 eprintln!(
-                    "Note: no system credential store was available, so the password is stored in a file only you can read."
+                    "Note: the system credential store is unavailable ({reason}), so the password is stored in a file only you can read."
                 );
             }
         }
-        LoginOutcome::BrowserSessionOnly { reason } => {
+        LoginOutcome::BrowserSessionOnly {
+            reason,
+            removed_saved,
+        } => {
             println!("Logged in with the browser session only.");
             eprintln!("Automatic re-login could not be set up: {reason}");
+            if removed_saved {
+                eprintln!("Previously saved credentials were removed.");
+            }
             eprintln!(
                 "Credentials were not saved; run `thu-learn login` again when this session expires."
             );
@@ -650,8 +669,8 @@ async fn cmd_login(username: Option<String>) -> Result<()> {
 /// Cookie-only browser login: no password is saved, so the session expires as before.
 async fn cmd_login_session_only() -> Result<()> {
     let client = Client::new(paths::cookie_path())?;
-    let forgot = auth::forget_credentials().await?;
     client.set_credentials(None).await;
+    let forgot = auth::forget_credentials().await;
     let cookies = browser_login::login_via_browser().await?;
     if cookies.is_empty() {
         anyhow::bail!("No cookies were captured. Login may be incomplete or timed out; try again.");
@@ -663,8 +682,10 @@ async fn cmd_login_session_only() -> Result<()> {
         .await
         .context("Imported cookies could not verify a logged-in session")?;
     crate::cache::clear(); // Clear stale cache after account changes or re-login.
-    if forgot {
-        eprintln!("Removed previously saved credentials.");
+    match forgot {
+        Ok(true) => eprintln!("Removed previously saved credentials."),
+        Ok(false) => {}
+        Err(e) => eprintln!("Warning: previously saved credentials could not be removed: {e:#}"),
     }
     println!(
         "Login succeeded. Saved {n} cookies locally.\n   No password was saved, so run `thu-learn login` again when the session expires."
@@ -674,7 +695,9 @@ async fn cmd_login_session_only() -> Result<()> {
 
 async fn cmd_logout() -> Result<()> {
     let client = Client::new(paths::cookie_path())?;
-    let removed = auth::logout(&client).await?;
+    let removed = auth::logout(&client)
+        .await
+        .context("Logout did not finish")?;
     if removed {
         println!("Logged out. Removed saved credentials, session cookies, and cache.");
     } else {
