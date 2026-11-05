@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+use crate::auth::{self, LoginOutcome};
 use crate::browser_login;
 use crate::client::Client;
 use crate::models::{short_id, Course, HomeworkStatus};
@@ -438,8 +439,22 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Log in through Chrome and save the session locally.
-    Login,
+    /// Log in once and stay logged in: expired sessions are renewed automatically.
+    ///
+    /// Asks for your Tsinghua username and password, then opens Chrome for captcha
+    /// and two-factor checks. Like learnX, the CLI trusts a random device ID during
+    /// two-factor authentication and saves the password and that ID in the system
+    /// credential store, so later sessions can be renewed without a browser.
+    Login {
+        /// Tsinghua username or student ID; asked interactively when omitted.
+        #[arg(short, long)]
+        username: Option<String>,
+        /// Only keep this browser session; do not save (and forget any saved) credentials.
+        #[arg(long)]
+        no_remember: bool,
+    },
+    /// Log out and delete saved credentials, session cookies, and cache.
+    Logout,
     /// List homework, optionally filtered by course, or show one homework item.
     #[command(visible_alias = "hw")]
     Homework {
@@ -519,7 +534,17 @@ pub async fn run() -> Result<()> {
     let cli = Cli::parse();
     let json = cli.json;
     match cli.command {
-        Commands::Login => cmd_login().await,
+        Commands::Login {
+            username,
+            no_remember,
+        } => {
+            if no_remember {
+                cmd_login_session_only().await
+            } else {
+                cmd_login(username).await
+            }
+        }
+        Commands::Logout => cmd_logout().await,
         Commands::Homework {
             id,
             all,
@@ -551,12 +576,11 @@ pub async fn run() -> Result<()> {
 
 // ---------- Login and course loading ----------
 
-/// Reuses saved session cookies, or asks the user to run `login` again.
+/// Reuses saved session cookies, renewing an expired session with saved credentials.
 async fn login_only() -> Result<Client> {
     let client = Client::new(paths::cookie_path())?;
-    client.confirm_session().await.map_err(|_| {
-        anyhow::anyhow!("Not logged in or the session has expired. Run `thu-learn login` first.")
-    })?;
+    // Errors already explain whether to run `thu-learn login`.
+    client.confirm_session().await?;
     Ok(client)
 }
 
@@ -569,8 +593,65 @@ async fn prepare() -> Result<(Client, Vec<Course>)> {
 
 // ---------- Commands ----------
 
-async fn cmd_login() -> Result<()> {
+async fn cmd_login(username: Option<String>) -> Result<()> {
     let client = Client::new(paths::cookie_path())?;
+    // A broken credential store should not block logging in again.
+    let saved = crate::credentials::load_async().await.unwrap_or_else(|e| {
+        eprintln!("Ignoring saved credentials: {e:#}");
+        None
+    });
+    let username = match username {
+        Some(u) => u.trim().to_string(),
+        None => prompt_username(saved.as_ref().map(|c| c.username.as_str()))?,
+    };
+    if username.is_empty() {
+        anyhow::bail!("A Tsinghua username is required.");
+    }
+    let password = rpassword::prompt_password("Password: ").context("Failed to read password")?;
+    if password.is_empty() {
+        anyhow::bail!("A password is required.");
+    }
+
+    let progress = |msg: &str| eprintln!("{msg}");
+    let outcome = auth::login(
+        &client,
+        username,
+        password,
+        saved.as_ref(),
+        browser_login::stdin_enter_signal,
+        &progress,
+    )
+    .await?;
+    crate::cache::clear(); // Clear stale cache after account changes or re-login.
+
+    match outcome {
+        LoginOutcome::SavedTrust(location) | LoginOutcome::Browser(location) => {
+            println!("Login succeeded. Credentials are saved in {location}.");
+            println!(
+                "   When the Learn session expires, thu-learn logs in again automatically; run `thu-learn logout` to remove them."
+            );
+            if let crate::credentials::Location::File(_) = location {
+                eprintln!(
+                    "Note: no system credential store was available, so the password is stored in a file only you can read."
+                );
+            }
+        }
+        LoginOutcome::BrowserSessionOnly { reason } => {
+            println!("Logged in with the browser session only.");
+            eprintln!("Automatic re-login could not be set up: {reason}");
+            eprintln!(
+                "Credentials were not saved; run `thu-learn login` again when this session expires."
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Cookie-only browser login: no password is saved, so the session expires as before.
+async fn cmd_login_session_only() -> Result<()> {
+    let client = Client::new(paths::cookie_path())?;
+    let forgot = auth::forget_credentials().await?;
+    client.set_credentials(None).await;
     let cookies = browser_login::login_via_browser().await?;
     if cookies.is_empty() {
         anyhow::bail!("No cookies were captured. Login may be incomplete or timed out; try again.");
@@ -582,10 +663,46 @@ async fn cmd_login() -> Result<()> {
         .await
         .context("Imported cookies could not verify a logged-in session")?;
     crate::cache::clear(); // Clear stale cache after account changes or re-login.
+    if forgot {
+        eprintln!("Removed previously saved credentials.");
+    }
     println!(
-        "Login succeeded. Saved {n} cookies locally.\n   You can now run thu-learn hw, ann, f, and related commands without logging in again."
+        "Login succeeded. Saved {n} cookies locally.\n   No password was saved, so run `thu-learn login` again when the session expires."
     );
     Ok(())
+}
+
+async fn cmd_logout() -> Result<()> {
+    let client = Client::new(paths::cookie_path())?;
+    let removed = auth::logout(&client).await?;
+    if removed {
+        println!("Logged out. Removed saved credentials, session cookies, and cache.");
+    } else {
+        println!("Logged out. Removed session cookies and cache.");
+    }
+    println!(
+        "   Tsinghua may still list this device as trusted; you can remove it from your account's trusted devices."
+    );
+    Ok(())
+}
+
+/// Asks for the username on stderr, offering the saved one as the default.
+fn prompt_username(default: Option<&str>) -> Result<String> {
+    use std::io::Write;
+    match default {
+        Some(d) => eprint!("Tsinghua username [{d}]: "),
+        None => eprint!("Tsinghua username: "),
+    }
+    std::io::stderr().flush().ok();
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .context("Failed to read username")?;
+    let line = line.trim();
+    Ok(match (line.is_empty(), default) {
+        (true, Some(d)) => d.to_string(),
+        _ => line.to_string(),
+    })
 }
 
 /// Returns the previous semester ID used to backfill older homework course names.

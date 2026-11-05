@@ -80,14 +80,16 @@ impl Client {
 
         // Query all three status endpoints concurrently; `aoData=[]` means no course filter.
         let futs = sources.iter().map(|(url, status)| async move {
-            let form = reqwest::multipart::Form::new().text("aoData", "[]");
-            let Ok(v) = self.post_multipart_json(url, form).await else {
-                return Vec::new();
+            let form = || reqwest::multipart::Form::new().text("aoData", "[]");
+            let v = match self.post_multipart_json(url, form).await {
+                Ok(v) => v,
+                Err(e) => return auth_error_or_empty(e),
             };
             let Some(arr) = find_array(&v, &["aaData", "object", "resultList"]) else {
-                return Vec::new();
+                return Ok(Vec::new());
             };
-            arr.iter()
+            Ok(arr
+                .iter()
                 .map(|h| {
                     // wlkcid = wangluo kecheng id = network course ID.
                     let course_id = pick(h, &["wlkcid", "wlkc_id", "kcid"]);
@@ -123,16 +125,16 @@ impl Client {
                         status: *status,
                     }
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>())
         });
         let nested = futures::future::join_all(futs).await;
-        Ok(nested.into_iter().flatten().collect())
+        flatten_results(nested)
     }
 
     /// Homework description. The `id` form field is the base homework ID (`zyid`), and `msg` carries the body.
     pub async fn homework_detail(&self, zyid: &str) -> Result<String> {
         let url = format!("{LEARN}/b/wlxt/kczy/zy/student/detail");
-        let form = reqwest::multipart::Form::new().text("id", zyid.to_string());
+        let form = || reqwest::multipart::Form::new().text("id", zyid.to_string());
         let v = self.post_multipart_json(&url, form).await?;
         Ok(strip_html(&pick(&v, &["msg"])))
     }
@@ -156,14 +158,16 @@ impl Client {
             let url = &url;
             async move {
                 let aodata = format!("[{{\"name\":\"wlkcid\",\"value\":\"{}\"}}]", course.id);
-                let form = reqwest::multipart::Form::new().text("aoData", aodata);
-                let Ok(v) = self.post_multipart_json(url, form).await else {
-                    return Vec::new();
+                let form = || reqwest::multipart::Form::new().text("aoData", aodata.clone());
+                let v = match self.post_multipart_json(url, form).await {
+                    Ok(v) => v,
+                    Err(e) => return auth_error_or_empty(e),
                 };
                 let Some(arr) = find_array(&v, &["aaData", "object", "resultList"]) else {
-                    return Vec::new();
+                    return Ok(Vec::new());
                 };
-                arr.iter()
+                Ok(arr
+                    .iter()
                     .map(|n| Notification {
                         // ggid = gonggao id = announcement ID.
                         id: pick(n, &["ggid", "id"]),
@@ -179,11 +183,11 @@ impl Client {
                         // ggnr = gonggao neirong = announcement content.
                         content: strip_html(&pick(n, &["ggnrStr", "ggnr"])),
                     })
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>())
             }
         });
         let nested = futures::future::join_all(futs).await;
-        Ok(nested.into_iter().flatten().collect())
+        flatten_results(nested)
     }
 
     /// Course file list for one course.
@@ -233,13 +237,15 @@ impl Client {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "submission".into());
         let bytes = tokio::fs::read(file).await?;
-        let part = reqwest::multipart::Part::bytes(bytes).file_name(filename);
-
-        let form = reqwest::multipart::Form::new()
-            .text("xszyid", student_homework_id.to_string())
-            .text("isDeleted", "0")
-            .text("zynr", comment.to_string())
-            .part("fileupload", part);
+        // Rebuilt if the upload is retried after a silent re-login.
+        let form = || {
+            let part = reqwest::multipart::Part::bytes(bytes.clone()).file_name(filename.clone());
+            reqwest::multipart::Form::new()
+                .text("xszyid", student_homework_id.to_string())
+                .text("isDeleted", "0")
+                .text("zynr", comment.to_string())
+                .part("fileupload", part)
+        };
 
         let v = self.post_multipart_json(&url, form).await?;
         // Success is returned as `result=success` or a `msg` containing the Learn literal `成功`.
@@ -263,7 +269,7 @@ impl Client {
         dump("course_list", self.get_json(&course_url).await);
 
         let hw_url = format!("{LEARN}/b/wlxt/kczy/zy/student/zyListWj");
-        let form = reqwest::multipart::Form::new().text("aoData", "[]");
+        let form = || reqwest::multipart::Form::new().text("aoData", "[]");
         let hw = self.post_multipart_json(&hw_url, form).await;
         dump("homework_zyListWj(aoData=[])", clone_result(&hw));
 
@@ -273,7 +279,7 @@ impl Client {
                 if let Some(h0) = arr.first() {
                     let zyid = pick(h0, &["zyid"]);
                     let detail = format!("{LEARN}/b/wlxt/kczy/zy/student/detail");
-                    let form = reqwest::multipart::Form::new().text("id", zyid.clone());
+                    let form = || reqwest::multipart::Form::new().text("id", zyid.clone());
                     dump(
                         "homework_detail(POST id=zyid)",
                         self.post_multipart_json(&detail, form).await,
@@ -283,7 +289,7 @@ impl Client {
         }
 
         let ann_url = format!("{LEARN}/b/wlxt/kcgg/wlkc_ggb/student/pageListXsbyWgq");
-        let form = reqwest::multipart::Form::new().text("aoData", "[]");
+        let form = || reqwest::multipart::Form::new().text("aoData", "[]");
         dump(
             "notification_Wgq(aoData=[])",
             self.post_multipart_json(&ann_url, form).await,
@@ -291,7 +297,7 @@ impl Client {
 
         if let Some(c) = courses.first() {
             let aodata = format!("[{{\"name\":\"wlkcid\",\"value\":\"{}\"}}]", c.id);
-            let form = reqwest::multipart::Form::new().text("aoData", aodata);
+            let form = || reqwest::multipart::Form::new().text("aoData", aodata.clone());
             dump(
                 &format!("notification_Wgq(wlkcid={})", c.id),
                 self.post_multipart_json(&ann_url, form).await,
@@ -332,6 +338,27 @@ fn clone_result(r: &Result<serde_json::Value>) -> Result<serde_json::Value> {
         Ok(v) => Ok(v.clone()),
         Err(e) => Err(anyhow::anyhow!("{e:#}")),
     }
+}
+
+// ---------- Error helpers ----------
+
+/// Keeps the best-effort behavior of list endpoints (a failed course or status
+/// list is skipped) but surfaces authentication failures instead of hiding them
+/// behind an empty list.
+fn auth_error_or_empty<T>(e: anyhow::Error) -> Result<Vec<T>> {
+    if e.downcast_ref::<crate::client::AuthError>().is_some() {
+        Err(e)
+    } else {
+        Ok(Vec::new())
+    }
+}
+
+fn flatten_results<T>(nested: Vec<Result<Vec<T>>>) -> Result<Vec<T>> {
+    let mut out = Vec::new();
+    for items in nested {
+        out.extend(items?);
+    }
+    Ok(out)
 }
 
 // ---------- JSON extraction helpers ----------

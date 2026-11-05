@@ -36,6 +36,13 @@ thirtyfour = "0.37.1"
 cookie_store = "0.21"
 url = "2.5.8"
 unicode-width = "0.2"
+sm2 = { version = "0.14", default-features = false, features = ["arithmetic", "pke", "getrandom", "std"] }
+keyring = "4.2"
+rpassword = "7"
+getrandom = { version = "0.4", features = ["sys_rng"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["net", "io-util"] }
 
 [profile.release]
 lto = true
