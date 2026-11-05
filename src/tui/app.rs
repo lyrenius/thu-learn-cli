@@ -297,6 +297,11 @@ pub struct App {
     selection: [Option<String>; 4],
     /// First visible row per tab, persisted between frames for stable scrolling.
     pub offsets: [usize; 4],
+    /// Visible rows of the list and detail panes, written by the renderer for paging.
+    pub list_height: usize,
+    pub detail_height: u16,
+    /// First key of a two-key sequence such as `gg`.
+    pending_g: bool,
     selection_changed_at: Instant,
     pub zoomed: bool,
     pub detail_scroll: u16,
@@ -333,6 +338,9 @@ impl App {
             searching: false,
             selection: Default::default(),
             offsets: [0; 4],
+            list_height: PAGE,
+            detail_height: PAGE as u16,
+            pending_g: false,
             selection_changed_at: Instant::now(),
             zoomed: false,
             detail_scroll: 0,
@@ -776,6 +784,21 @@ impl App {
             self.on_search_key(key);
             return Vec::new();
         }
+        // `gg` jumps to the top, as in yazi; any other key cancels the prefix.
+        if std::mem::take(&mut self.pending_g) {
+            if key.code == KeyCode::Char('g') {
+                if self.zoomed {
+                    self.detail_scroll = 0;
+                } else {
+                    self.move_selection(isize::MIN / 2);
+                }
+            }
+            return Vec::new();
+        }
+        if key.code == KeyCode::Char('g') {
+            self.pending_g = true;
+            return Vec::new();
+        }
         if self.zoomed {
             if let Some(effects) = self.on_zoom_key(key) {
                 return effects;
@@ -818,22 +841,23 @@ impl App {
     /// Keys that behave differently while the detail pane is zoomed.
     /// Returns `None` to fall through to normal handling.
     fn on_zoom_key(&mut self, key: KeyEvent) -> Option<Vec<Effect>> {
-        let page = 10;
+        let page = self.detail_height.max(1) as i32;
+        match paging(key) {
+            Some(Paging::Half(dir)) => self.scroll_detail(dir * (page / 2).max(1)),
+            Some(Paging::Full(dir)) => self.scroll_detail(dir * page),
+            None => {}
+        }
+        if paging(key).is_some() {
+            return Some(Vec::new());
+        }
         match key.code {
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Backspace => {
                 self.zoomed = false
             }
             KeyCode::Down | KeyCode::Char('j') => self.scroll_detail(1),
             KeyCode::Up | KeyCode::Char('k') => self.scroll_detail(-1),
-            KeyCode::PageDown | KeyCode::Char(' ') => self.scroll_detail(page),
-            KeyCode::PageUp | KeyCode::Char('b') => self.scroll_detail(-page),
-            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.scroll_detail(page)
-            }
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.scroll_detail(-page)
-            }
-            KeyCode::Home | KeyCode::Char('g') => self.detail_scroll = 0,
+            KeyCode::Char(' ') => self.scroll_detail(page),
+            KeyCode::Home => self.detail_scroll = 0,
             KeyCode::End | KeyCode::Char('G') => self.detail_scroll = self.detail_max_scroll,
             KeyCode::Char('n') => self.move_selection(1),
             KeyCode::Char('p') => self.move_selection(-1),
@@ -843,7 +867,6 @@ impl App {
     }
 
     fn on_normal_key(&mut self, key: KeyEvent) -> Vec<Effect> {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('?') => self.overlay = Some(Overlay::Help),
@@ -858,11 +881,17 @@ impl App {
             }
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
-            KeyCode::Char('d') if ctrl => self.move_selection(PAGE as isize),
-            KeyCode::Char('u') if ctrl => self.move_selection(-(PAGE as isize)),
-            KeyCode::PageDown => self.move_selection(PAGE as isize),
-            KeyCode::PageUp => self.move_selection(-(PAGE as isize)),
-            KeyCode::Home | KeyCode::Char('g') => self.move_selection(isize::MIN / 2),
+            _ if paging(key).is_some() => {
+                let page = self.list_height.max(1) as isize;
+                match paging(key) {
+                    Some(Paging::Half(dir)) => {
+                        self.move_selection(dir as isize * (page / 2).max(1))
+                    }
+                    Some(Paging::Full(dir)) => self.move_selection(dir as isize * page),
+                    None => {}
+                }
+            }
+            KeyCode::Home => self.move_selection(isize::MIN / 2),
             KeyCode::End | KeyCode::Char('G') => self.move_selection(isize::MAX / 2),
             KeyCode::Char('J') => self.scroll_detail(3),
             KeyCode::Char('K') => self.scroll_detail(-3),
@@ -1268,6 +1297,32 @@ impl App {
     }
 }
 
+/// Page movement keys from yazi's default keymap.
+pub enum Paging {
+    /// `-1` up or `1` down by half a page.
+    Half(i32),
+    /// `-1` up or `1` down by a full page.
+    Full(i32),
+}
+
+/// `C-u`/`C-d` and `S-PageUp`/`S-PageDown` move half a page; `C-b`/`C-f` and
+/// `PageUp`/`PageDown` move a full page.
+pub fn paging(key: KeyEvent) -> Option<Paging> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    match key.code {
+        KeyCode::Char('u') if ctrl => Some(Paging::Half(-1)),
+        KeyCode::Char('d') if ctrl => Some(Paging::Half(1)),
+        KeyCode::Char('b') if ctrl => Some(Paging::Full(-1)),
+        KeyCode::Char('f') if ctrl => Some(Paging::Full(1)),
+        KeyCode::PageUp if shift => Some(Paging::Half(-1)),
+        KeyCode::PageDown if shift => Some(Paging::Half(1)),
+        KeyCode::PageUp => Some(Paging::Full(-1)),
+        KeyCode::PageDown => Some(Paging::Full(1)),
+        _ => None,
+    }
+}
+
 fn matches_query(q: &str, fields: &[&str]) -> bool {
     q.is_empty() || fields.iter().any(|f| f.to_lowercase().contains(q))
 }
@@ -1633,6 +1688,29 @@ pub(crate) mod tests {
         assert_eq!(app.session, Session::Checking);
         assert_eq!(app.on_msg(Msg::SessionReady), vec![Effect::LoadAll]);
         assert_eq!(app.session, Session::Ready);
+    }
+
+    #[test]
+    fn list_motions_follow_yazi_keys() {
+        let mut app = ready_app();
+        app.homework_filter = HomeworkFilter::All;
+        app.list_height = 2;
+        press(&mut app, KeyCode::Char('G'));
+        assert_eq!(app.selected_index(Tab::Homework), Some(3));
+        // A single `g` waits for the second key; `gg` goes to the top.
+        press(&mut app, KeyCode::Char('g'));
+        assert_eq!(app.selected_index(Tab::Homework), Some(3));
+        press(&mut app, KeyCode::Char('g'));
+        assert_eq!(app.selected_index(Tab::Homework), Some(0));
+        // `g` followed by another key cancels without moving.
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.selected_index(Tab::Homework), Some(0));
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        app.on_key(ctrl('f')); // full page = 2 rows
+        assert_eq!(app.selected_index(Tab::Homework), Some(2));
+        app.on_key(ctrl('u')); // half page = 1 row
+        assert_eq!(app.selected_index(Tab::Homework), Some(1));
     }
 
     #[test]

@@ -492,6 +492,8 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect, table: ListTable) {
         .column_spacing(1)
         .row_highlight_style(Style::new().bg(Color::DarkGray).fg(Color::White).bold())
         .highlight_symbol("▌");
+    // Borders and the header row are not list rows.
+    app.list_height = area.height.saturating_sub(3) as usize;
     let mut state = TableState::default()
         .with_offset(app.offsets[tab.index()])
         .with_selected(selected);
@@ -749,6 +751,7 @@ fn draw_detail(f: &mut Frame, app: &mut App, area: Rect) {
     let inner = b.inner(area).inner(Margin::new(1, 0));
     let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
     let total = paragraph.line_count(inner.width) as u16;
+    app.detail_height = inner.height;
     app.detail_max_scroll = total.saturating_sub(inner.height);
     app.detail_scroll = app.detail_scroll.min(app.detail_max_scroll);
     if app.detail_max_scroll > 0 {
