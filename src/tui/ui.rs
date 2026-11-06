@@ -1,7 +1,7 @@
 //! Rendering for the TUI. Everything here reads [`App`] state and draws it;
 //! the only writes back are scroll bookkeeping the layout decides.
 
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Datelike, Local};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Margin, Rect};
 use ratatui::style::{Color, Style};
@@ -133,6 +133,20 @@ fn status_style(h: &Homework, now: DateTime<Local>) -> (&'static str, Color) {
         HomeworkStatus::Pending => ("Pending", Color::Yellow),
         HomeworkStatus::Submitted => ("Submitted", Color::Green),
         HomeworkStatus::Graded => ("Graded", Color::Cyan),
+    }
+}
+
+/// Format and width for deadlines in one list: `MM-DD HH:MM` while they all
+/// fall in the current year, otherwise with the year, because without it a
+/// list sorted by deadline looks shuffled across New Year.
+fn deadline_format(
+    now: DateTime<Local>,
+    deadlines: impl IntoIterator<Item = DateTime<Local>>,
+) -> (&'static str, u16) {
+    if deadlines.into_iter().all(|d| d.year() == now.year()) {
+        ("%m-%d %H:%M", 11)
+    } else {
+        ("%Y-%m-%d %H:%M", 16)
     }
 }
 
@@ -617,7 +631,8 @@ fn draw_homework_list(f: &mut Frame, app: &mut App, area: Rect) {
     let now = app.now;
     let list = app.visible_homework();
     let course_w = course_width(list.iter().map(|h| h.course_name.as_str()), 18);
-    let fixed = [9, course_w, 11, 7];
+    let (due_fmt, due_w) = deadline_format(now, list.iter().filter_map(|h| h.deadline));
+    let fixed = [9, course_w, due_w, 7];
     let title_w = flex_width(area, &fixed);
     let rows: Vec<Row<'static>> = list
         .iter()
@@ -631,9 +646,9 @@ fn draw_homework_list(f: &mut Frame, app: &mut App, area: Rect) {
                     } else {
                         Span::raw("")
                     };
-                    (d.format("%m-%d %H:%M").to_string(), left)
+                    (d.format(due_fmt).to_string(), left)
                 }
-                None => (fit(&clean(&h.deadline_raw), 11), Span::raw("")),
+                None => (fit(&clean(&h.deadline_raw), due_w as usize), Span::raw("")),
             };
             Row::new(vec![
                 Cell::from(Span::styled(label, Style::new().fg(color))),
@@ -658,7 +673,7 @@ fn draw_homework_list(f: &mut Frame, app: &mut App, area: Rect) {
         Constraint::Length(9),
         Constraint::Length(course_w),
         Constraint::Fill(1),
-        Constraint::Length(11),
+        Constraint::Length(due_w),
         Constraint::Length(7),
     ];
     let header = vec!["Status", "Course", "Title", "Deadline", "Left"];
@@ -1235,12 +1250,13 @@ fn course_detail(app: &App, c: &Course, width: usize) -> Vec<Line<'static>> {
     if pending.is_empty() {
         rows.push(Line::styled("Nothing due.", muted()));
     }
+    let (due_fmt, _) = deadline_format(now, pending.iter().filter_map(|h| h.deadline));
     for h in pending {
         let (due, left) = match h.deadline {
             Some(d) => {
                 let (t, col) = time_left(d, now);
                 (
-                    d.format("%m-%d %H:%M").to_string(),
+                    d.format(due_fmt).to_string(),
                     Span::styled(format!("  {t}"), Style::new().fg(col)),
                 )
             }
@@ -1968,5 +1984,30 @@ mod tests {
         let screen = render(&mut app, 120, 20);
         app.on_mouse(click(find(&screen, "Esc clear")));
         assert!(!app.searching);
+    }
+
+    #[test]
+    fn deadlines_show_the_year_once_a_list_crosses_new_year() {
+        use crate::tui::app::tests::homework;
+
+        let row = |screen: &str| -> String {
+            let line = screen.lines().find(|l| l.contains("Socket report"));
+            line.unwrap().to_string()
+        };
+        let mut app = ready_app();
+        let screen = render(&mut app, 120, 20);
+        assert!(row(&screen).contains(" 06-02 08:00"), "{screen}");
+        assert!(!row(&screen).contains("2026-"), "{screen}");
+
+        app.homework.data.push(homework(
+            "next",
+            "c1",
+            "Final project",
+            Some(local_dt(2027, 1, 3, 23, 59)),
+            HomeworkStatus::Pending,
+        ));
+        let screen = render(&mut app, 120, 20);
+        assert!(row(&screen).contains("2026-06-02 08:00"), "{screen}");
+        assert!(screen.contains("2027-01-03 23:59"), "{screen}");
     }
 }
