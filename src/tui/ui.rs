@@ -1311,7 +1311,7 @@ fn draw_session(f: &mut Frame, app: &App, area: Rect) {
         Session::Checking => (
             " Connecting ",
             vec![Line::from(format!(
-                "{spin} Checking the saved Learn session…"
+                "{spin} Checking the saved thu-learn session…"
             ))],
         ),
         Session::LoggedOut(reason) => (
