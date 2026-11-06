@@ -472,7 +472,8 @@ fn draw_folder(
     }
 }
 
-fn draw_marker(f: &mut Frame, x: u16, y: u16) {
+/// yazi's selection marker; the main Files list draws it too.
+pub fn draw_marker(f: &mut Frame, x: u16, y: u16) {
     f.render_widget(
         Paragraph::new(Span::styled(
             "│",

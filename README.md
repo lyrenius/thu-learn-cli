@@ -42,10 +42,11 @@ The screen shows a list on the left and details for the selected item on the rig
 | `↑`/`↓`, `j`/`k`, `PgUp`/`PgDn`, `g`/`G` | Move the selection |
 | `Enter` | Open details full screen (in Courses: show that course's homework) |
 | `J`/`K` | Scroll details; `n`/`p` move to the next/previous item while details are open |
-| `/` | Search the current list; `Esc` clears the search, then the course filter |
+| `/` | Search the current list; `Esc` clears the search, then the file selection, then the course filter |
 | `c` | Choose a course for every tab |
 | `f` | Homework: cycle pending, overdue, done, all. Announcements: toggle unread only |
-| `d` | Download the selected homework's attachments or the selected file |
+| `Space`, `v`/`V`, `C-a`/`C-r` | Files: select like yazi. Toggle and move down, visual select/unselect (move to extend the range, `Esc` applies it), select all, invert |
+| `d` | Download the highlighted homework's attachments or the highlighted file; with files selected, every selected file |
 | `s` | Submit a file for the selected homework through the file picker (below) |
 | `D` / `o` | Change the download folder / open the last download |
 | `r` | Refresh from Learn |
@@ -79,7 +80,7 @@ Input popups work like yazi's: they open in insert mode, `Esc` switches to a vi-
 
 Differences from yazi, because the picker uploads exactly one file: `Enter` on a folder enters it instead of choosing it, choosing more than one file is refused, and keys that change files, run shell commands, use tabs, or call plugins (fd, rg, fzf, zoxide) show a notice instead. Folder listings refresh about once a second while the picker is open. The picker opens in the download folder and then remembers the last folder you submitted from.
 
-Downloads go to the current directory unless `--dir` or `D` says otherwise, and never overwrite an existing file (a ` (1)` suffix is added). Detail panes show each item's short ID so it can be passed to CLI commands.
+Downloads go to the current directory unless `--dir` or `D` says otherwise, and never overwrite an existing file (a ` (1)` suffix is added). Downloading selected files asks first, saves them into one folder per course (for example `Networks/Lab 1.pdf`), and fetches four at a time. Detail panes show each item's short ID so it can be passed to CLI commands.
 
 When stdout is not a terminal, `thu-learn` without a command prints help instead of starting the TUI, so scripts and agents never get stuck in an interactive screen.
 

@@ -9,7 +9,7 @@
 //! credentials, and without a usable session the TUI asks the user to run
 //! `thu-learn login` and retry.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -180,6 +180,16 @@ pub struct CourseData {
     pub previous: Vec<Course>,
 }
 
+/// yazi's visual mode in the Files tab: the files between `anchor` and the
+/// cursor count as selected (or, with `unset`, as unselected) until `Esc` or
+/// an action applies the range.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Visual {
+    /// File ID where the range starts.
+    anchor: String,
+    pub unset: bool,
+}
+
 /// Work for the runtime to perform outside the pure state.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Effect {
@@ -196,6 +206,11 @@ pub enum Effect {
     },
     DownloadFile {
         file: CourseFile,
+        dir: PathBuf,
+    },
+    /// Download several files into one folder per course under `dir`.
+    DownloadFiles {
+        files: Vec<CourseFile>,
         dir: PathBuf,
     },
     DownloadAttachments {
@@ -228,7 +243,15 @@ pub enum Msg {
         id: String,
         result: Result<HomeworkDetail, String>,
     },
-    Downloaded(Result<Vec<PathBuf>, String>),
+    DownloadProgress {
+        done: usize,
+        total: usize,
+    },
+    /// Saved paths and `name: error` descriptions of failed downloads.
+    Downloaded {
+        saved: Vec<PathBuf>,
+        failed: Vec<String>,
+    },
     Submitted {
         id: String,
         result: Result<(), String>,
@@ -291,6 +314,9 @@ pub struct App {
     pub files: Remote<Vec<CourseFile>>,
     pub details: HashMap<String, DetailState>,
     pub course_filter: Option<String>,
+    /// Files selected with yazi's selection keys, by file ID.
+    pub selected_files: HashSet<String>,
+    pub visual: Option<Visual>,
     pub homework_filter: HomeworkFilter,
     pub announcement_filter: AnnouncementFilter,
     /// Per-tab search queries, indexed by [`Tab::index`].
@@ -335,6 +361,8 @@ impl App {
             files: Remote::default(),
             details: HashMap::new(),
             course_filter: None,
+            selected_files: HashSet::new(),
+            visual: None,
             homework_filter: HomeworkFilter::Pending,
             announcement_filter: AnnouncementFilter::All,
             search: Default::default(),
@@ -554,6 +582,38 @@ impl App {
             .count()
     }
 
+    /// File IDs from the visual anchor to the cursor, while the anchor is visible.
+    fn visual_range(&self) -> Option<Vec<String>> {
+        let visual = self.visual.as_ref()?;
+        let keys = self.visible_keys(Tab::Files);
+        let anchor = keys.iter().position(|k| *k == visual.anchor)?;
+        let cursor = self.selected_index(Tab::Files)?;
+        Some(keys[anchor.min(cursor)..=anchor.max(cursor)].to_vec())
+    }
+
+    /// Selected file IDs, counting an unapplied visual range as applied.
+    pub fn marked_files(&self) -> HashSet<String> {
+        let mut marked = self.selected_files.clone();
+        if let (Some(visual), Some(range)) = (&self.visual, self.visual_range()) {
+            for id in range {
+                if visual.unset {
+                    marked.remove(&id);
+                } else {
+                    marked.insert(id);
+                }
+            }
+        }
+        marked
+    }
+
+    /// Ends visual mode and applies its range to the selection.
+    fn apply_visual(&mut self) {
+        if self.visual.is_some() {
+            self.selected_files = self.marked_files();
+            self.visual = None;
+        }
+    }
+
     /// Resets detail scrolling when the selected item changes.
     pub fn sync_detail_key(&mut self) {
         let key = self.selected_key(self.tab).map(|k| (self.tab, k));
@@ -637,6 +697,8 @@ impl App {
                         failures.join("; ")
                     ));
                 }
+                let ids: HashSet<&str> = files.iter().map(|f| f.id.as_str()).collect();
+                self.selected_files.retain(|id| ids.contains(id.as_str()));
                 self.files.finish(Ok(files));
             }
             Msg::HomeworkDetail { id, result } => {
@@ -646,23 +708,12 @@ impl App {
                 };
                 self.details.insert(id, state);
             }
-            Msg::Downloaded(result) => {
+            Msg::DownloadProgress { done, total } => {
+                self.info(format!("Downloading… {done} of {total}"));
+            }
+            Msg::Downloaded { saved, failed } => {
                 self.in_flight = self.in_flight.saturating_sub(1);
-                match result {
-                    Ok(paths) if paths.len() == 1 => {
-                        self.success(format!("Saved {} · o to open", paths[0].display()));
-                        self.last_download = paths.into_iter().next();
-                    }
-                    Ok(paths) => {
-                        self.success(format!(
-                            "Saved {} files to {} · o to open the folder",
-                            paths.len(),
-                            self.download_dir.display()
-                        ));
-                        self.last_download = Some(self.download_dir.clone());
-                    }
-                    Err(e) => self.error(format!("Download failed: {e}")),
-                }
+                self.report_download(saved, failed);
             }
             Msg::Submitted { id, result } => {
                 self.in_flight = self.in_flight.saturating_sub(1);
@@ -683,6 +734,38 @@ impl App {
             Msg::OpenFailed(e) => self.error(format!("Could not open: {e}")),
         }
         Vec::new()
+    }
+
+    fn report_download(&mut self, saved: Vec<PathBuf>, failed: Vec<String>) {
+        let target = match saved.as_slice() {
+            [] => {
+                self.error(format!("Download failed: {}", failed.join("; ")));
+                return;
+            }
+            [one] => one.clone(),
+            [first, rest @ ..] => match first.parent() {
+                Some(parent) if rest.iter().all(|p| p.parent() == Some(parent)) => {
+                    parent.to_path_buf()
+                }
+                _ => self.download_dir.clone(),
+            },
+        };
+        let total = saved.len() + failed.len();
+        if !failed.is_empty() {
+            self.error(format!(
+                "Saved {} of {total} files · failed: {}",
+                saved.len(),
+                failed.join("; ")
+            ));
+        } else if saved.len() == 1 {
+            self.success(format!("Saved {} · o to open", target.display()));
+        } else {
+            self.success(format!(
+                "Saved {total} files to {} · o to open the folder",
+                target.display()
+            ));
+        }
+        self.last_download = Some(target);
     }
 
     fn all_courses(&self) -> Vec<Course> {
@@ -865,7 +948,61 @@ impl App {
         Some(Vec::new())
     }
 
+    /// yazi's selection keys, which act on the Files list. Returns whether
+    /// `key` was one of them.
+    fn on_select_key(&mut self, key: KeyEvent) -> bool {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let is_select = match key.code {
+            KeyCode::Char(' ' | 'v' | 'V') => !ctrl,
+            KeyCode::Char('a' | 'r') => ctrl,
+            _ => false,
+        };
+        if !is_select || self.zoomed {
+            return is_select;
+        }
+        if self.tab != Tab::Files {
+            self.info("Select files in the Files tab.");
+            return true;
+        }
+        match key.code {
+            KeyCode::Char(' ') => {
+                if let Some(id) = self.selected_key(Tab::Files) {
+                    if !self.selected_files.remove(&id) {
+                        self.selected_files.insert(id);
+                    }
+                }
+                self.move_selection(1);
+            }
+            KeyCode::Char(c @ ('v' | 'V')) => {
+                // As in yazi, entering visual mode again starts a new range here.
+                if let Some(anchor) = self.selected_key(Tab::Files) {
+                    self.visual = Some(Visual {
+                        anchor,
+                        unset: c == 'V',
+                    });
+                }
+            }
+            KeyCode::Char('a') => {
+                self.apply_visual();
+                let visible = self.visible_keys(Tab::Files);
+                self.selected_files.extend(visible);
+            }
+            _ => {
+                self.apply_visual();
+                for id in self.visible_keys(Tab::Files) {
+                    if !self.selected_files.remove(&id) {
+                        self.selected_files.insert(id);
+                    }
+                }
+            }
+        }
+        true
+    }
+
     fn on_normal_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        if self.on_select_key(key) {
+            return Vec::new();
+        }
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('?') => self.overlay = Some(Overlay::Help),
@@ -906,19 +1043,26 @@ impl App {
                     self.zoomed = true;
                 }
             }
+            // yazi's escape order: visual range, then filter, then selection.
             KeyCode::Esc => {
-                if !self.search[self.tab.index()].is_empty() {
+                if self.visual.is_some() {
+                    self.apply_visual();
+                } else if !self.search[self.tab.index()].is_empty() {
                     self.search[self.tab.index()].clear();
+                } else if self.tab == Tab::Files && !self.selected_files.is_empty() {
+                    self.selected_files.clear();
                 } else if self.course_filter.is_some() {
                     self.course_filter = None;
                     self.info("Showing all courses");
                 }
             }
             KeyCode::Char('/') => {
+                self.apply_visual();
                 self.searching = true;
                 self.zoomed = false;
             }
             KeyCode::Char('c') => {
+                self.apply_visual();
                 let selected = self
                     .course_filter
                     .as_ref()
@@ -969,6 +1113,7 @@ impl App {
 
     fn switch_tab(&mut self, tab: Tab) {
         if self.tab != tab {
+            self.apply_visual();
             self.tab = tab;
             self.zoomed = false;
             self.selection_changed_at = Instant::now();
@@ -995,6 +1140,11 @@ impl App {
     fn download_selected(&mut self) -> Vec<Effect> {
         match self.tab {
             Tab::Files => {
+                self.apply_visual();
+                if !self.selected_files.is_empty() {
+                    self.confirm_batch_download();
+                    return Vec::new();
+                }
                 let Some(file) = self.selected_file().cloned() else {
                     return Vec::new();
                 };
@@ -1031,6 +1181,45 @@ impl App {
             }
             _ => Vec::new(),
         }
+    }
+
+    /// Asks before downloading every selected file into one folder per course.
+    fn confirm_batch_download(&mut self) {
+        let mut files: Vec<CourseFile> = self
+            .files
+            .data
+            .iter()
+            .filter(|f| self.selected_files.contains(&f.id))
+            .cloned()
+            .collect();
+        // Same order as the list, including selected files a search now hides.
+        files.sort_by(|a, b| b.upload_time.cmp(&a.upload_time));
+        let courses: HashSet<&str> = files.iter().map(|f| f.course_id.as_str()).collect();
+        let mut lines = vec![
+            format!(
+                "{} from {}",
+                count(files.len(), "file"),
+                count(courses.len(), "course")
+            ),
+            format!("To {}, one folder per course", self.download_dir.display()),
+            String::new(),
+        ];
+        const LISTED: usize = 5;
+        for f in files.iter().take(LISTED) {
+            lines.push(format!("{} | {}", f.course_name, f.title));
+        }
+        if files.len() > LISTED {
+            lines.push(format!("… and {} more", files.len() - LISTED));
+        }
+        self.overlay = Some(Overlay::Confirm {
+            title: format!("Download {}?", count(files.len(), "file")),
+            lines,
+            effect: Box::new(Effect::DownloadFiles {
+                files,
+                dir: self.download_dir.clone(),
+            }),
+            back: None,
+        });
     }
 
     fn open_submit_form(&mut self) {
@@ -1104,9 +1293,18 @@ impl App {
                 back,
             } => match key.code {
                 KeyCode::Char('y' | 'Y') | KeyCode::Enter => {
-                    if matches!(*effect, Effect::Submit { .. }) {
-                        self.in_flight += 1;
-                        self.info("Submitting…");
+                    match &*effect {
+                        Effect::Submit { .. } => {
+                            self.in_flight += 1;
+                            self.info("Submitting…");
+                        }
+                        Effect::DownloadFiles { files, .. } => {
+                            self.in_flight += 1;
+                            self.info(format!("Downloading {}…", count(files.len(), "file")));
+                            // yazi clears the selection once an action has used it.
+                            self.selected_files.clear();
+                        }
+                        _ => {}
                     }
                     return vec![*effect];
                 }
@@ -1219,6 +1417,15 @@ pub fn paging(key: KeyEvent) -> Option<Paging> {
         KeyCode::PageUp => Some(Paging::Full(-1)),
         KeyCode::PageDown => Some(Paging::Full(1)),
         _ => None,
+    }
+}
+
+/// `1 file`, `3 files`.
+fn count(n: usize, noun: &str) -> String {
+    if n == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{n} {noun}s")
     }
 }
 
@@ -1341,8 +1548,50 @@ pub(crate) mod tests {
         app
     }
 
+    pub fn course_file(id: &str, course_id: &str, title: &str, uploaded: &str) -> CourseFile {
+        let course_name = if course_id == "c1" {
+            "Data Structures"
+        } else {
+            "Networks"
+        };
+        CourseFile {
+            id: id.into(),
+            course_id: course_id.into(),
+            course_name: course_name.into(),
+            title: title.into(),
+            size: "1.0M".into(),
+            file_type: "pdf".into(),
+            upload_time: uploaded.into(),
+            description: String::new(),
+        }
+    }
+
+    /// [`ready_app`] on the Files tab. Newest first, the list is f4, f3, f2, f1.
+    pub fn files_app() -> App {
+        let mut app = ready_app();
+        app.files.finish(Ok(vec![
+            course_file("f1", "c1", "L1 intro", "2026-03-01 10:00"),
+            course_file("f2", "c1", "L2 heap", "2026-03-08 10:00"),
+            course_file("f3", "c2", "Lab 1", "2026-03-15 10:00"),
+            course_file("f4", "c2", "Lab 2", "2026-03-22 10:00"),
+        ]));
+        app.tab = Tab::Files;
+        app
+    }
+
     fn press(app: &mut App, code: KeyCode) -> Vec<Effect> {
         app.on_key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    fn ctrl(app: &mut App, c: char) -> Vec<Effect> {
+        app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL))
+    }
+
+    /// Selected file IDs, sorted, counting an unapplied visual range.
+    fn marked(app: &App) -> Vec<String> {
+        let mut ids: Vec<String> = app.marked_files().into_iter().collect();
+        ids.sort();
+        ids
     }
 
     fn type_text(app: &mut App, text: &str) {
@@ -1485,14 +1734,228 @@ pub(crate) mod tests {
             }]
         );
         assert_eq!(app.in_flight, 1);
-        app.on_msg(Msg::Downloaded(Ok(vec![PathBuf::from(
-            "/tmp/downloads/spec.pdf",
-        )])));
+        app.on_msg(Msg::Downloaded {
+            saved: vec![PathBuf::from("/tmp/downloads/spec.pdf")],
+            failed: Vec::new(),
+        });
         assert_eq!(app.in_flight, 0);
         assert_eq!(
             press(&mut app, KeyCode::Char('o')),
             vec![Effect::OpenPath(PathBuf::from("/tmp/downloads/spec.pdf"))]
         );
+    }
+
+    #[test]
+    fn file_selection_follows_yazi_keys() {
+        let mut app = files_app();
+        // Space toggles the hovered file, then moves down.
+        press(&mut app, KeyCode::Char(' '));
+        assert_eq!(marked(&app), ["f4"]);
+        assert_eq!(app.selected_index(Tab::Files), Some(1));
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Char('k'));
+        press(&mut app, KeyCode::Char(' '));
+        assert_eq!(marked(&app), ["f4"]);
+
+        // C-a selects every visible file and C-r inverts; C-r is not refresh.
+        ctrl(&mut app, 'a');
+        assert_eq!(marked(&app), ["f1", "f2", "f3", "f4"]);
+        assert!(ctrl(&mut app, 'r').is_empty());
+        assert!(marked(&app).is_empty());
+        press(&mut app, KeyCode::Char(' ')); // f2
+        ctrl(&mut app, 'r');
+        assert_eq!(marked(&app), ["f1", "f3", "f4"]);
+        press(&mut app, KeyCode::Esc);
+        assert!(marked(&app).is_empty());
+
+        // C-a only adds visible files, and Esc clears the search before the selection.
+        press(&mut app, KeyCode::Char('/'));
+        type_text(&mut app, "lab");
+        press(&mut app, KeyCode::Enter);
+        ctrl(&mut app, 'a');
+        assert_eq!(marked(&app), ["f3", "f4"]);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.visible_files().len(), 4);
+        assert_eq!(marked(&app), ["f3", "f4"]);
+        press(&mut app, KeyCode::Esc);
+        assert!(marked(&app).is_empty());
+
+        // C-d still pages.
+        app.list_height = 2;
+        press(&mut app, KeyCode::Home);
+        ctrl(&mut app, 'd');
+        assert_eq!(app.selected_index(Tab::Files), Some(1));
+        assert!(marked(&app).is_empty());
+
+        // Other tabs only explain where selection works.
+        press(&mut app, KeyCode::Char('1'));
+        press(&mut app, KeyCode::Char(' '));
+        assert_eq!(
+            app.status.as_ref().map(|s| s.text.as_str()),
+            Some("Select files in the Files tab.")
+        );
+        assert!(marked(&app).is_empty());
+    }
+
+    #[test]
+    fn visual_mode_selects_and_unselects_ranges() {
+        let mut app = files_app();
+        press(&mut app, KeyCode::Char('v'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('j'));
+        // The range shows as selected before it is applied.
+        assert_eq!(marked(&app), ["f2", "f3", "f4"]);
+        assert!(app.selected_files.is_empty());
+        press(&mut app, KeyCode::Esc);
+        assert!(app.visual.is_none());
+        assert_eq!(marked(&app), ["f2", "f3", "f4"]);
+
+        // V unselects from f2 up to f3; moving on reshapes the range.
+        press(&mut app, KeyCode::Char('V'));
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!(marked(&app), ["f4"]);
+        press(&mut app, KeyCode::Char('G'));
+        assert_eq!(marked(&app), ["f3", "f4"]);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(marked(&app), ["f3", "f4"]);
+
+        // Switching tabs applies a pending range.
+        press(&mut app, KeyCode::Char('v'));
+        press(&mut app, KeyCode::Char('1'));
+        assert!(app.visual.is_none());
+        assert_eq!(marked(&app), ["f1", "f3", "f4"]);
+
+        // So does d, before it asks.
+        press(&mut app, KeyCode::Char('3'));
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('v'));
+        press(&mut app, KeyCode::Char('G'));
+        press(&mut app, KeyCode::Char('d'));
+        assert!(app.visual.is_none());
+        assert_eq!(app.selected_files.len(), 4);
+        assert!(matches!(app.overlay, Some(Overlay::Confirm { .. })));
+    }
+
+    #[test]
+    fn batch_download_confirms_then_clears_selection() {
+        let mut app = files_app();
+        press(&mut app, KeyCode::Char(' ')); // f4
+        press(&mut app, KeyCode::Char(' ')); // f3
+        assert!(press(&mut app, KeyCode::Char('d')).is_empty());
+        let Some(Overlay::Confirm { title, lines, .. }) = &app.overlay else {
+            panic!("expected a confirmation, got {:?}", app.overlay);
+        };
+        assert_eq!(title, "Download 2 files?");
+        assert_eq!(lines[0], "2 files from 1 course");
+        assert_eq!(lines[1], "To /tmp/downloads, one folder per course");
+        assert!(lines.contains(&"Networks | Lab 2".to_string()));
+
+        // Declining keeps the selection.
+        press(&mut app, KeyCode::Char('n'));
+        assert!(app.overlay.is_none());
+        assert_eq!(marked(&app), ["f3", "f4"]);
+
+        press(&mut app, KeyCode::Char('d'));
+        let effects = press(&mut app, KeyCode::Char('y'));
+        let [Effect::DownloadFiles { files, dir }] = effects.as_slice() else {
+            panic!("expected DownloadFiles, got {effects:?}");
+        };
+        let mut ids: Vec<&str> = files.iter().map(|f| f.id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, ["f3", "f4"]);
+        assert_eq!(dir, &PathBuf::from("/tmp/downloads"));
+        assert_eq!(app.in_flight, 1);
+        assert!(app.selected_files.is_empty());
+
+        // Without a selection, d downloads the hovered file at once.
+        let effects = press(&mut app, KeyCode::Char('d'));
+        assert!(
+            matches!(effects.as_slice(), [Effect::DownloadFile { file, .. }] if file.id == "f2"),
+            "{effects:?}"
+        );
+    }
+
+    #[test]
+    fn download_results_report_partial_failures() {
+        let mut app = files_app();
+        let finish = |app: &mut App, saved: &[&str], failed: &[&str]| {
+            app.in_flight += 1;
+            app.on_msg(Msg::Downloaded {
+                saved: saved.iter().map(PathBuf::from).collect(),
+                failed: failed.iter().map(|s| s.to_string()).collect(),
+            });
+            let status = app.status.as_ref().unwrap();
+            (status.kind, status.text.clone())
+        };
+
+        // Files from several courses: o opens the download folder.
+        let status = finish(
+            &mut app,
+            &[
+                "/tmp/downloads/Networks/a.pdf",
+                "/tmp/downloads/Data Structures/b.pdf",
+            ],
+            &[],
+        );
+        assert_eq!(
+            status,
+            (
+                StatusKind::Success,
+                "Saved 2 files to /tmp/downloads · o to open the folder".into()
+            )
+        );
+        assert_eq!(app.last_download, Some(PathBuf::from("/tmp/downloads")));
+
+        // One course: its folder.
+        finish(
+            &mut app,
+            &[
+                "/tmp/downloads/Networks/a.pdf",
+                "/tmp/downloads/Networks/b.pdf",
+            ],
+            &[],
+        );
+        assert_eq!(
+            app.last_download,
+            Some(PathBuf::from("/tmp/downloads/Networks"))
+        );
+
+        // A partial failure is an error that still counts what was saved.
+        let status = finish(
+            &mut app,
+            &["/tmp/downloads/Networks/a.pdf"],
+            &["Lab 2: HTTP 500"],
+        );
+        assert_eq!(
+            status,
+            (
+                StatusKind::Error,
+                "Saved 1 of 2 files · failed: Lab 2: HTTP 500".into()
+            )
+        );
+        assert_eq!(
+            app.last_download,
+            Some(PathBuf::from("/tmp/downloads/Networks/a.pdf"))
+        );
+
+        let status = finish(&mut app, &[], &["Lab 2: HTTP 500"]);
+        assert_eq!(
+            status,
+            (StatusKind::Error, "Download failed: Lab 2: HTTP 500".into())
+        );
+        assert_eq!(app.in_flight, 0);
+    }
+
+    #[test]
+    fn refresh_drops_missing_selections() {
+        let mut app = files_app();
+        ctrl(&mut app, 'a');
+        app.on_msg(Msg::Files {
+            files: vec![course_file("f1", "c1", "L1 intro", "2026-03-01 10:00")],
+            failures: Vec::new(),
+        });
+        assert_eq!(marked(&app), ["f1"]);
     }
 
     fn temp_dir(tag: &str) -> PathBuf {

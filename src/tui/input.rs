@@ -282,21 +282,28 @@ pub fn safe_file_name(name: &str) -> String {
     }
 }
 
-/// Returns `dir/name`, or `dir/name (n).ext` when that path exists or is reserved.
-pub fn unique_path(dir: &Path, name: &str, reserved: &[PathBuf]) -> PathBuf {
-    let taken = |p: &Path| p.exists() || reserved.iter().any(|r| r == p);
-    let first = dir.join(name);
-    if !taken(&first) {
-        return first;
-    }
+/// Creates an empty `dir/name`, or `dir/name (n).ext` when that path exists,
+/// and returns its path. Creation is atomic, so concurrent downloads with the
+/// same name never claim, and then overwrite, the same file.
+pub fn claim_unique_path(dir: &Path, name: &str) -> std::io::Result<PathBuf> {
     let (stem, ext) = match name.rfind('.') {
         Some(i) if i > 0 => (&name[..i], &name[i..]),
         _ => (name, ""),
     };
-    (1..)
-        .map(|n| dir.join(format!("{stem} ({n}){ext}")))
-        .find(|p| !taken(p))
-        .expect("an unused file name always exists")
+    let candidates = std::iter::once(dir.join(name))
+        .chain((1..).map(|n| dir.join(format!("{stem} ({n}){ext}"))));
+    for path in candidates {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(_) => return Ok(path),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!("an unused file name always exists")
 }
 
 #[cfg(test)]
@@ -402,16 +409,17 @@ mod tests {
     }
 
     #[test]
-    fn unique_path_avoids_existing_and_reserved_names() {
+    fn claim_unique_path_never_reuses_a_name() {
         let dir = temp_dir("unique");
         std::fs::write(dir.join("hw.pdf"), b"x").unwrap();
-        let reserved = vec![dir.join("hw (1).pdf")];
-        assert_eq!(
-            unique_path(&dir, "hw.pdf", &reserved),
-            dir.join("hw (2).pdf")
-        );
-        assert_eq!(unique_path(&dir, "new.pdf", &[]), dir.join("new.pdf"));
-        assert_eq!(unique_path(&dir, "README", &[]), dir.join("README"));
+        let claim = |name| claim_unique_path(&dir, name).unwrap();
+        assert_eq!(claim("hw.pdf"), dir.join("hw (1).pdf"));
+        // The first claim created the file, so a second one moves on.
+        assert_eq!(claim("hw.pdf"), dir.join("hw (2).pdf"));
+        assert_eq!(std::fs::read(dir.join("hw.pdf")).unwrap(), b"x");
+        assert_eq!(claim("new.pdf"), dir.join("new.pdf"));
+        assert_eq!(claim("README"), dir.join("README"));
+        assert!(claim_unique_path(&dir.join("missing"), "a.pdf").is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 

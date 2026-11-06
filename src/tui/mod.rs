@@ -26,7 +26,7 @@ use crate::client::{AuthError, Client};
 use crate::models::{Course, CourseFile, HomeworkAttachment};
 use crate::paths;
 use app::{App, CourseData, Effect, HomeworkDetail, Msg};
-use input::{safe_file_name, unique_path};
+use input::{claim_unique_path, safe_file_name};
 
 pub struct Options {
     /// Directory for downloads; can be changed inside the TUI.
@@ -34,6 +34,8 @@ pub struct Options {
 }
 
 const TICK: Duration = Duration::from_millis(100);
+/// Files fetched at once by a batch download, so Learn never gets dozens of requests together.
+const DOWNLOAD_CONCURRENCY: usize = 4;
 
 /// Messages from background tasks. A new client is handed to the runtime,
 /// everything else goes to the app state.
@@ -51,6 +53,26 @@ fn send(tx: &Tx, msg: Msg) {
 
 fn err_text(e: anyhow::Error) -> String {
     format!("{e:#}")
+}
+
+fn download_failed(e: String) -> Msg {
+    Msg::Downloaded {
+        saved: Vec::new(),
+        failed: vec![e],
+    }
+}
+
+/// Collects labelled download results; a failure is reported as `label: error`.
+fn downloaded(results: impl IntoIterator<Item = (String, Result<PathBuf>)>) -> Msg {
+    let mut saved = Vec::new();
+    let mut failed = Vec::new();
+    for (label, result) in results {
+        match result {
+            Ok(path) => saved.push(path),
+            Err(e) => failed.push(format!("{label}: {}", err_text(e))),
+        }
+    }
+    Msg::Downloaded { saved, failed }
 }
 
 pub async fn run(options: Options) -> Result<()> {
@@ -200,26 +222,36 @@ impl Runtime {
                 });
             }
             Effect::DownloadFile { file, dir } => {
-                let Some(client) = self.client(|e| Msg::Downloaded(Err(e))) else {
+                let Some(client) = self.client(download_failed) else {
                     return;
                 };
                 tokio::spawn(async move {
-                    let result = download_file(&client, &file, &dir)
-                        .await
-                        .map(|p| vec![p])
-                        .map_err(err_text);
-                    send(&tx, Msg::Downloaded(result));
+                    let msg = match download_file(&client, &file, &dir).await {
+                        Ok(path) => Msg::Downloaded {
+                            saved: vec![path],
+                            failed: Vec::new(),
+                        },
+                        Err(e) => download_failed(err_text(e)),
+                    };
+                    send(&tx, msg);
+                });
+            }
+            Effect::DownloadFiles { files, dir } => {
+                let Some(client) = self.client(download_failed) else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let msg = download_files(&client, &files, &dir, &tx).await;
+                    send(&tx, msg);
                 });
             }
             Effect::DownloadAttachments { attachments, dir } => {
-                let Some(client) = self.client(|e| Msg::Downloaded(Err(e))) else {
+                let Some(client) = self.client(download_failed) else {
                     return;
                 };
                 tokio::spawn(async move {
-                    let result = download_attachments(&client, &attachments, &dir)
-                        .await
-                        .map_err(err_text);
-                    send(&tx, Msg::Downloaded(result));
+                    let msg = download_attachments(&client, &attachments, &dir).await;
+                    send(&tx, msg);
                 });
             }
             Effect::Submit {
@@ -355,11 +387,49 @@ async fn download_file(client: &Client, file: &CourseFile, dir: &Path) -> Result
     tokio::fs::create_dir_all(dir)
         .await
         .with_context(|| format!("Could not create {}", dir.display()))?;
-    let dest = unique_path(dir, &safe_file_name(&name), &[]);
-    tokio::fs::write(&dest, &bytes)
-        .await
-        .with_context(|| format!("Could not write {}", dest.display()))?;
+    let dest = claim_unique_path(dir, &safe_file_name(&name))
+        .with_context(|| format!("Could not create a file in {}", dir.display()))?;
+    if let Err(e) = tokio::fs::write(&dest, &bytes).await {
+        tokio::fs::remove_file(&dest).await.ok();
+        return Err(e).with_context(|| format!("Could not write {}", dest.display()));
+    }
     Ok(dest)
+}
+
+/// Batch downloads go to one folder per course.
+fn course_folder(file: &CourseFile) -> String {
+    let name = if file.course_name.trim().is_empty() {
+        &file.course_id
+    } else {
+        &file.course_name
+    };
+    safe_file_name(name)
+}
+
+/// Downloads course files into one folder per course, a few at a time, and
+/// reports progress after each file.
+async fn download_files(client: &Client, files: &[CourseFile], dir: &Path, tx: &Tx) -> Msg {
+    let total = files.len();
+    // Owned items: with borrowed ones, rustc cannot show that the spawned
+    // future is `Send` ("implementation of `FnOnce` is not general enough").
+    let mut downloads = futures::stream::iter(files.to_vec())
+        .map(|file| async move {
+            let result = download_file(client, &file, &dir.join(course_folder(&file))).await;
+            (file.title, result)
+        })
+        .buffer_unordered(DOWNLOAD_CONCURRENCY);
+    let mut results = Vec::with_capacity(total);
+    while let Some(result) = downloads.next().await {
+        results.push(result);
+        send(
+            tx,
+            Msg::DownloadProgress {
+                done: results.len(),
+                total,
+            },
+        );
+    }
+    downloaded(results)
 }
 
 /// Downloads attachments concurrently without overwriting existing files.
@@ -367,34 +437,26 @@ async fn download_attachments(
     client: &Client,
     attachments: &[HomeworkAttachment],
     dir: &Path,
-) -> Result<Vec<PathBuf>> {
-    tokio::fs::create_dir_all(dir)
-        .await
-        .with_context(|| format!("Could not create {}", dir.display()))?;
-    let mut dests: Vec<PathBuf> = Vec::new();
-    for a in attachments {
-        let dest = unique_path(dir, &safe_file_name(&a.filename), &dests);
-        dests.push(dest);
+) -> Msg {
+    if let Err(e) = tokio::fs::create_dir_all(dir).await {
+        return download_failed(format!("Could not create {}: {e}", dir.display()));
     }
-    let results = futures::future::join_all(
-        attachments
-            .iter()
-            .zip(&dests)
-            .map(|(a, dest)| client.download(&a.download_path, dest)),
-    )
-    .await;
-    let mut saved = Vec::new();
-    let mut failed = Vec::new();
-    for ((a, dest), result) in attachments.iter().zip(dests).zip(results) {
-        match result {
-            Ok(_) => saved.push(dest),
-            Err(e) => failed.push(format!("{}: {}", a.filename, err_text(e))),
+    let results = futures::future::join_all(attachments.iter().map(|a| async move {
+        let result = async {
+            // Claimed in order on the first poll, so equal names number predictably.
+            let dest = claim_unique_path(dir, &safe_file_name(&a.filename))
+                .with_context(|| format!("Could not create a file in {}", dir.display()))?;
+            if let Err(e) = client.download(&a.download_path, &dest).await {
+                tokio::fs::remove_file(&dest).await.ok();
+                return Err(e);
+            }
+            Ok(dest)
         }
-    }
-    if saved.is_empty() && !failed.is_empty() {
-        anyhow::bail!("{}", failed.join("; "));
-    }
-    Ok(saved)
+        .await;
+        (a.filename.clone(), result)
+    }))
+    .await;
+    downloaded(results)
 }
 
 /// Opens a file or folder with the desktop's default application.
@@ -528,5 +590,44 @@ mod tests {
             network,
             "The saved session could not be verified (connection refused)."
         );
+    }
+
+    #[test]
+    fn batch_downloads_use_a_safe_course_folder() {
+        use super::course_folder;
+        use crate::models::CourseFile;
+
+        let file = |course_id: &str, course_name: &str| CourseFile {
+            id: "f".into(),
+            course_id: course_id.into(),
+            course_name: course_name.into(),
+            title: "slides".into(),
+            size: String::new(),
+            file_type: "pdf".into(),
+            upload_time: String::new(),
+            description: String::new(),
+        };
+        assert_eq!(course_folder(&file("c1", "数据结构")), "数据结构");
+        assert_eq!(
+            course_folder(&file("c1", "C/C++ 程序设计")),
+            "C_C++ 程序设计"
+        );
+        assert_eq!(course_folder(&file("c1", "  ")), "c1");
+    }
+
+    #[test]
+    fn download_results_keep_failure_labels() {
+        use super::{downloaded, Msg};
+        use std::path::PathBuf;
+
+        let msg = downloaded([
+            ("a.pdf".to_string(), Ok(PathBuf::from("/d/a.pdf"))),
+            ("b.pdf".to_string(), Err(anyhow::anyhow!("HTTP 404"))),
+        ]);
+        let Msg::Downloaded { saved, failed } = msg else {
+            panic!("expected Downloaded");
+        };
+        assert_eq!(saved, vec![PathBuf::from("/d/a.pdf")]);
+        assert_eq!(failed, vec!["b.pdf: HTTP 404".to_string()]);
     }
 }

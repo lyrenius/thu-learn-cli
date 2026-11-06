@@ -329,7 +329,7 @@ fn draw_keys(f: &mut Frame, app: &App, area: Rect) {
                 let mut v = vec![("↑↓", "scroll"), ("n/p", "next/prev")];
                 match app.tab {
                     Tab::Homework => v.extend([("d", "download"), ("s", "submit")]),
-                    Tab::Files => v.push(("d", "download")),
+                    Tab::Files => v.push(("d", download_hint(app))),
                     _ => {}
                 }
                 v.push(("Esc", "back"));
@@ -342,7 +342,14 @@ fn draw_keys(f: &mut Frame, app: &App, area: Rect) {
                         v.extend([("d", "download"), ("s", "submit"), ("f", "filter")])
                     }
                     Tab::Announcements => v.push(("f", "unread")),
-                    Tab::Files => v.push(("d", "download")),
+                    Tab::Files if app.visual.is_some() => {
+                        v.extend([("Esc", "apply"), ("d", "download selected")])
+                    }
+                    Tab::Files => v.extend([
+                        ("Space", "select"),
+                        ("v", "visual"),
+                        ("d", download_hint(app)),
+                    ]),
                     Tab::Courses => v[1] = ("⏎", "show homework"),
                 }
                 v.extend([
@@ -358,6 +365,14 @@ fn draw_keys(f: &mut Frame, app: &App, area: Rect) {
     };
     let (spans, _) = fit_hints(&hints, area.width as usize);
     f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn download_hint(app: &App) -> &'static str {
+    if app.marked_files().is_empty() {
+        "download"
+    } else {
+        "download selected"
+    }
 }
 
 /// Lays out key hints in `width` cells. Trailing `?`, `q`, and `Esc` hints are
@@ -425,6 +440,22 @@ fn list_title(app: &App) -> Line<'static> {
             format!("· {course} "),
             Style::new().fg(ACCENT),
         ));
+    }
+    let marked = app.marked_files().len();
+    if app.tab == Tab::Files && (marked > 0 || app.visual.is_some()) {
+        spans.push(Span::styled(
+            format!("· {marked} selected "),
+            Style::new().fg(Color::LightYellow),
+        ));
+    }
+    if let (Tab::Files, Some(visual)) = (app.tab, &app.visual) {
+        // yazi's mode badge for visual select and unset modes.
+        let mode = if visual.unset { " UNS " } else { " SEL " };
+        spans.push(Span::styled(
+            mode,
+            Style::new().fg(Color::Black).bg(Color::LightYellow).bold(),
+        ));
+        spans.push(Span::raw(" "));
     }
     Line::from(spans)
 }
@@ -626,6 +657,8 @@ fn draw_announcement_list(f: &mut Frame, app: &mut App, area: Rect) {
 
 fn draw_file_list(f: &mut Frame, app: &mut App, area: Rect) {
     let list = app.visible_files();
+    let marked_ids = app.marked_files();
+    let marked: Vec<bool> = list.iter().map(|x| marked_ids.contains(&x.id)).collect();
     let course_w = course_width(list.iter().map(|x| x.course_name.as_str()), 16);
     let fixed = [course_w, 5, 9, 10];
     let title_w = flex_width(area, &fixed);
@@ -660,6 +693,13 @@ fn draw_file_list(f: &mut Frame, app: &mut App, area: Rect) {
         loading,
     };
     draw_table(f, app, area, table);
+    // Like yazi, selected rows get a marker on the pane's left edge, below
+    // the top border and the header row.
+    let offset = app.offsets[Tab::Files.index()];
+    let shown = marked.iter().enumerate().skip(offset).take(app.list_height);
+    for (i, _) in shown.filter(|(_, m)| **m) {
+        picker_view::draw_marker(f, area.x, area.y + 2 + (i - offset) as u16);
+    }
 }
 
 fn draw_course_list(f: &mut Frame, app: &mut App, area: Rect) {
@@ -1045,11 +1085,19 @@ fn file_detail(app: &App, x: &CourseFile, width: usize) -> Vec<Line<'static>> {
         );
     }
     lines.push(Line::raw(""));
-    let mut hint = key_hint("d", "download to");
+    let selected = app.marked_files().len();
+    let mut hint = if selected == 0 {
+        key_hint("d", "download to")
+    } else {
+        key_hint("d", &format!("download {selected} selected to"))
+    };
     hint.push(Span::styled(
         app.download_dir.display().to_string(),
         muted(),
     ));
+    if selected > 0 {
+        hint.push(Span::styled(", one folder per course", muted()));
+    }
     lines.push(Line::from(hint));
     lines
 }
@@ -1191,13 +1239,13 @@ fn popup(f: &mut Frame, width: u16, height: u16, title: &str) -> (Rect, Block<'s
     (area, b)
 }
 
-const HELP: [(&str, &[(&str, &str)]); 4] = [
+const HELP: [(&str, &[(&str, &str)]); 5] = [
     (
         "Navigate",
         &[
             ("1-4 Tab ←→", "switch tabs"),
             ("↑↓ j k", "move selection"),
-            ("PgUp PgDn g G", "page, top, bottom"),
+            ("gg G", "top, bottom"),
             ("⏎", "open details"),
             ("J K", "scroll details"),
             ("n p", "next/previous in details"),
@@ -1208,8 +1256,18 @@ const HELP: [(&str, &[(&str, &str)]); 4] = [
         &[
             ("/", "search the current list"),
             ("c", "choose a course"),
-            ("f", "cycle homework status / unread"),
+            ("f", "cycle status / toggle unread"),
             ("Esc", "clear search, then course"),
+        ],
+    ),
+    (
+        "Select files",
+        &[
+            ("Space", "toggle and move down"),
+            ("v V", "visual select / unselect"),
+            ("C-a C-r", "select all / invert"),
+            ("Esc", "apply visual, then clear"),
+            ("d", "download the selected files"),
         ],
     ),
     (
@@ -1222,7 +1280,7 @@ const HELP: [(&str, &[(&str, &str)]); 4] = [
             ("r", "refresh from Learn"),
         ],
     ),
-    ("App", &[("?", "toggle help"), ("q Ctrl-C", "quit")]),
+    ("App", &[("?", "toggle help"), ("q C-c", "quit")]),
 ];
 
 fn help_section(name: &str, keys: &[(&str, &str)]) -> Vec<Line<'static>> {
@@ -1407,7 +1465,7 @@ fn draw_download_dir(f: &mut Frame, input: &super::input::Input, error: Option<&
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::app::tests::{local_dt, ready_app};
+    use crate::tui::app::tests::{files_app, local_dt, ready_app};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -1624,6 +1682,32 @@ mod tests {
         app.overlay = Some(Overlay::Help);
         let screen = render(&mut app, 120, 40);
         assert!(screen.contains("submit homework"));
+        assert!(screen.contains("visual select / unselect"));
         assert!(screen.contains("/tmp/downloads"));
+    }
+
+    #[test]
+    fn selected_files_get_yazi_markers_and_a_count() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut app = files_app();
+        app.selected_files = ["f4", "f2"].into_iter().map(String::from).collect();
+        let screen = render(&mut app, 120, 20);
+        assert!(screen.contains("Files · 2 selected"), "{screen}");
+        assert!(screen.contains("download selected"), "{screen}");
+
+        // Rows start below the top border (y = 1) and the header (y = 2):
+        // f4, f3, f2, f1. Markers sit on the left border.
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let marker_rows: Vec<u16> = (0..20)
+            .filter(|&y| terminal.backend().buffer()[(0, y)].bg == Color::LightYellow)
+            .collect();
+        assert_eq!(marker_rows, [3, 5]);
+
+        app.on_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+        let screen = render(&mut app, 120, 20);
+        assert!(screen.contains("2 selected  SEL"), "{screen}");
+        assert!(screen.contains("Esc apply"), "{screen}");
     }
 }
