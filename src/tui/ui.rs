@@ -1131,7 +1131,8 @@ fn homework_detail(app: &App, h: &Homework, width: usize) -> Vec<Line<'static>> 
         None => {}
     }
     if !h.submit_time.is_empty() {
-        lines.push(field("Submitted", vec![Span::raw(clean(&h.submit_time))]));
+        let submitted = crate::api::display_time(&h.submit_time);
+        lines.push(field("Submitted", vec![Span::raw(clean(&submitted))]));
     }
     if let Some(g) = &h.grade {
         let mut v = vec![Span::styled(clean(g), Style::new().fg(Color::Cyan).bold())];

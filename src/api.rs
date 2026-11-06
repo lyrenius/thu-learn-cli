@@ -422,6 +422,15 @@ fn is_semester_id(s: &str) -> bool {
             && [a, b, t].iter().all(|p| p.bytes().all(|c| c.is_ascii_digit())))
 }
 
+/// A Learn time (a millisecond timestamp or a date string) as
+/// `YYYY-MM-DD HH:MM`, or unchanged when it is neither.
+pub fn display_time(raw: &str) -> String {
+    match parse_deadline(raw) {
+        Some(t) => t.format("%Y-%m-%d %H:%M").to_string(),
+        None => raw.to_string(),
+    }
+}
+
 fn find_array<'a>(v: &'a Value, keys: &[&str]) -> Option<Vec<&'a Value>> {
     // Some Learn endpoints return the array as the response root.
     if let Value::Array(a) = v {
@@ -837,6 +846,19 @@ mod tests {
         let wrapped = serde_json::json!({"resultList": [{"xnxq": "2023-2024-3"}]});
         assert_eq!(parse_semester_list(&wrapped), ["2023-2024-3"]);
         assert!(parse_semester_list(&serde_json::json!({"result": "x"})).is_empty());
+    }
+
+    #[test]
+    fn display_time_formats_timestamps_and_keeps_other_text() {
+        use chrono::TimeZone;
+        let expected = chrono::Local
+            .timestamp_millis_opt(1_758_280_999_000)
+            .unwrap()
+            .format("%Y-%m-%d %H:%M")
+            .to_string();
+        assert_eq!(display_time("1758280999000"), expected);
+        assert_eq!(display_time("2025-09-19 19:23:19"), "2025-09-19 19:23");
+        assert_eq!(display_time("soon"), "soon");
     }
 
     #[test]
