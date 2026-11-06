@@ -14,7 +14,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::{Position, Rect};
 
 use super::input::{complete_path, expand_path, normalize_pasted_path, Input};
 use super::picker::{CursorShape, Outcome, Picker};
@@ -190,6 +191,28 @@ pub struct Visual {
     pub unset: bool,
 }
 
+/// Screen areas of the last frame, for mouse hit-testing. The renderer
+/// clears and refills them on every draw, so hidden panes have empty areas.
+#[derive(Debug, Clone, Default)]
+pub struct Hits {
+    /// Header tab titles.
+    pub tabs: Vec<(Rect, Tab)>,
+    /// The list pane, and its item rows without the border and header.
+    pub list: Rect,
+    pub rows: Rect,
+    pub detail: Rect,
+    /// Course picker rows and the index of the first one shown.
+    pub courses: Rect,
+    pub courses_offset: usize,
+    /// The confirmation's `[Y]es` and `(N)o` buttons.
+    pub yes: Rect,
+    pub no: Rect,
+    /// Key hints in the bottom bar and action hints at the end of the
+    /// details; clicking one presses its key.
+    pub keys: Vec<(Rect, KeyEvent)>,
+    pub actions: Vec<(Rect, KeyEvent)>,
+}
+
 /// Work for the runtime to perform outside the pure state.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Effect {
@@ -336,6 +359,8 @@ pub struct App {
     pub detail_scroll: u16,
     /// Largest useful scroll value, written by the renderer.
     pub detail_max_scroll: u16,
+    /// Written by the renderer.
+    pub hits: Hits,
     detail_key: Option<(Tab, String)>,
     pub overlay: Option<Overlay>,
     pub status: Option<Status>,
@@ -376,6 +401,7 @@ impl App {
             zoomed: false,
             detail_scroll: 0,
             detail_max_scroll: u16::MAX,
+            hits: Hits::default(),
             detail_key: None,
             overlay: None,
             status: None,
@@ -1031,18 +1057,7 @@ impl App {
             KeyCode::End | KeyCode::Char('G') => self.move_selection(isize::MAX / 2),
             KeyCode::Char('J') => self.scroll_detail(3),
             KeyCode::Char('K') => self.scroll_detail(-3),
-            KeyCode::Enter => {
-                if self.tab == Tab::Courses {
-                    if let Some(c) = self.selected_course() {
-                        let (id, name) = (c.id.clone(), c.name.clone());
-                        self.course_filter = Some(id);
-                        self.switch_tab(Tab::Homework);
-                        self.info(format!("Showing {name} · Esc or c to change"));
-                    }
-                } else if self.selected_key(self.tab).is_some() {
-                    self.zoomed = true;
-                }
-            }
+            KeyCode::Enter => self.open_selected(),
             // yazi's escape order: visual range, then filter, then selection.
             KeyCode::Esc => {
                 if self.visual.is_some() {
@@ -1109,6 +1124,20 @@ impl App {
             _ => {}
         }
         Vec::new()
+    }
+
+    /// Opens details full screen; in Courses, shows that course's homework.
+    fn open_selected(&mut self) {
+        if self.tab == Tab::Courses {
+            if let Some(c) = self.selected_course() {
+                let (id, name) = (c.id.clone(), c.name.clone());
+                self.course_filter = Some(id);
+                self.switch_tab(Tab::Homework);
+                self.info(format!("Showing {name} · Esc or c to change"));
+            }
+        } else if self.selected_key(self.tab).is_some() {
+            self.zoomed = true;
+        }
     }
 
     fn switch_tab(&mut self, tab: Tab) {
@@ -1277,15 +1306,10 @@ impl App {
                 }
                 self.overlay = Some(Overlay::CoursePicker { selected });
             }
-            Overlay::Submit(mut submit) => match submit.picker.on_key(key) {
-                Outcome::Continue => self.overlay = Some(Overlay::Submit(submit)),
-                Outcome::Cancel => self.info("Submission cancelled."),
-                Outcome::Copy(text) => {
-                    self.overlay = Some(Overlay::Submit(submit));
-                    return vec![Effect::Copy(text)];
-                }
-                Outcome::Submit { file, comment } => self.review_submission(submit, file, comment),
-            },
+            Overlay::Submit(mut submit) => {
+                let outcome = submit.picker.on_key(key);
+                return self.on_picker_outcome(submit, outcome);
+            }
             Overlay::Confirm {
                 title,
                 lines,
@@ -1353,6 +1377,127 @@ impl App {
             },
         }
         Vec::new()
+    }
+
+    fn on_picker_outcome(&mut self, submit: Box<SubmitState>, outcome: Outcome) -> Vec<Effect> {
+        match outcome {
+            Outcome::Continue => self.overlay = Some(Overlay::Submit(submit)),
+            Outcome::Cancel => self.info("Submission cancelled."),
+            Outcome::Copy(text) => {
+                self.overlay = Some(Overlay::Submit(submit));
+                return vec![Effect::Copy(text)];
+            }
+            Outcome::Submit { file, comment } => self.review_submission(submit, file, comment),
+        }
+        Vec::new()
+    }
+
+    /// Mouse input, following yazi: a click on a list row selects it, a right
+    /// click also opens it, and the wheel moves the list or scrolls details.
+    /// Tabs, course picker rows, and confirmation buttons can be clicked.
+    pub fn on_mouse(&mut self, event: MouseEvent) -> Vec<Effect> {
+        let pos = Position::new(event.column, event.row);
+        let (button, step) = match event.kind {
+            MouseEventKind::Down(b) => (Some(b), 0),
+            MouseEventKind::ScrollDown => (None, 1),
+            MouseEventKind::ScrollUp => (None, -1),
+            _ => return Vec::new(),
+        };
+        let hint = |hits: &[(Rect, KeyEvent)]| {
+            let left = button == Some(MouseButton::Left);
+            let hit = hits.iter().find(|(r, _)| r.contains(pos));
+            hit.filter(|_| left).map(|&(_, key)| key)
+        };
+        if let Some(key) = hint(&self.hits.keys) {
+            return self.on_key(key);
+        }
+        if let Some(overlay) = self.overlay.take() {
+            return self.on_overlay_mouse(overlay, event, pos);
+        }
+        if self.session != Session::Ready {
+            return Vec::new();
+        }
+        self.pending_g = false;
+        if let Some(key) = hint(&self.hits.actions) {
+            self.searching = false;
+            return self.on_key(key);
+        }
+        match button {
+            None if self.hits.detail.contains(pos) => self.scroll_detail(3 * step),
+            None if self.hits.list.contains(pos) => self.move_selection(step as isize),
+            Some(MouseButton::Left | MouseButton::Right) => {
+                let tab = self.hits.tabs.iter().find(|(r, _)| r.contains(pos));
+                if let Some(&(_, tab)) = tab {
+                    self.searching = false;
+                    self.switch_tab(tab);
+                } else if let Some(row) = self.row_at(pos) {
+                    self.searching = false;
+                    let current = self.selected_index(self.tab).unwrap_or(0);
+                    self.move_selection(row as isize - current as isize);
+                    if button == Some(MouseButton::Right) {
+                        self.open_selected();
+                    }
+                }
+            }
+            _ => {}
+        }
+        Vec::new()
+    }
+
+    /// The visible list row under `pos`.
+    fn row_at(&self, pos: Position) -> Option<usize> {
+        if !self.hits.rows.contains(pos) {
+            return None;
+        }
+        let row = self.offsets[self.tab.index()] + (pos.y - self.hits.rows.y) as usize;
+        (row < self.visible_keys(self.tab).len()).then_some(row)
+    }
+
+    /// Popups take clicks on their own rows and buttons, as the matching key.
+    fn on_overlay_mouse(
+        &mut self,
+        overlay: Overlay,
+        event: MouseEvent,
+        pos: Position,
+    ) -> Vec<Effect> {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let left = event.kind == MouseEventKind::Down(MouseButton::Left);
+        match overlay {
+            Overlay::Submit(mut submit) => {
+                let outcome = submit.picker.on_mouse(event);
+                self.on_picker_outcome(submit, outcome)
+            }
+            Overlay::CoursePicker { selected } => {
+                let row =
+                    self.hits.courses_offset + pos.y.saturating_sub(self.hits.courses.y) as usize;
+                let overlay = Overlay::CoursePicker { selected };
+                match event.kind {
+                    MouseEventKind::ScrollDown => self.on_overlay_key(overlay, key(KeyCode::Down)),
+                    MouseEventKind::ScrollUp => self.on_overlay_key(overlay, key(KeyCode::Up)),
+                    _ if left
+                        && self.hits.courses.contains(pos)
+                        && row <= self.courses.current.len() =>
+                    {
+                        let overlay = Overlay::CoursePicker { selected: row };
+                        self.on_overlay_key(overlay, key(KeyCode::Enter))
+                    }
+                    _ => {
+                        self.overlay = Some(overlay);
+                        Vec::new()
+                    }
+                }
+            }
+            Overlay::Confirm { .. } if left && self.hits.yes.contains(pos) => {
+                self.on_overlay_key(overlay, key(KeyCode::Char('y')))
+            }
+            Overlay::Confirm { .. } if left && self.hits.no.contains(pos) => {
+                self.on_overlay_key(overlay, key(KeyCode::Char('n')))
+            }
+            overlay => {
+                self.overlay = Some(overlay);
+                Vec::new()
+            }
+        }
     }
 
     /// Shows the confirmation for a file chosen in the picker; declining it

@@ -11,7 +11,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use super::editor::Editor;
 use super::fs::{self, Category, Entry, Preview};
 use super::keymap::{self, Linemode};
-use super::{Cmp, Folder, Level, Matcher, Picker, Popup, PreviewContent, CMP_ROWS, HELP_ROWS};
+use super::{
+    Areas, Cmp, Folder, Level, Matcher, Picker, Popup, PreviewContent, CMP_ROWS, HELP_ROWS,
+};
 use crate::cli::strip_terminal_controls;
 
 /// What the picker is choosing a file for, shown above yazi's header.
@@ -259,6 +261,11 @@ pub fn draw(f: &mut Frame, area: Rect, p: &mut Picker, ctx: &Context) {
         ..c3
     };
     p.set_limits(main.height as usize, preview_area.height as usize);
+    p.areas = Areas {
+        parent: parent_area,
+        current: current_area,
+        preview: preview_area,
+    };
     p.sync_preview();
 
     draw_banner(f, banner, ctx);

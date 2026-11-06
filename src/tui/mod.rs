@@ -17,7 +17,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyEventKind,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    EventStream, KeyEventKind, MouseEventKind,
 };
 use futures::StreamExt;
 use tokio::sync::mpsc;
@@ -77,10 +78,23 @@ fn downloaded(results: impl IntoIterator<Item = (String, Result<PathBuf>)>) -> M
 
 pub async fn run(options: Options) -> Result<()> {
     let mut terminal = ratatui::try_init().context("Failed to initialize the terminal")?;
-    crossterm::execute!(std::io::stdout(), EnableBracketedPaste).ok();
+    // ratatui's panic hook restores the screen but not mouse reporting, which
+    // would otherwise keep printing escape codes in the shell after a crash.
+    let restore_screen = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        crossterm::execute!(
+            std::io::stdout(),
+            DisableMouseCapture,
+            DisableBracketedPaste
+        )
+        .ok();
+        restore_screen(info);
+    }));
+    crossterm::execute!(std::io::stdout(), EnableBracketedPaste, EnableMouseCapture).ok();
     let result = event_loop(&mut terminal, options).await;
     crossterm::execute!(
         std::io::stdout(),
+        DisableMouseCapture,
         DisableBracketedPaste,
         SetCursorStyle::DefaultUserShape
     )
@@ -120,6 +134,13 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal, options: Options) -
                     app.on_paste(&text);
                     Vec::new()
                 }
+                // Mouse reporting also sends every move; skip redrawing for those.
+                Some(Ok(Event::Mouse(m))) => match m.kind {
+                    MouseEventKind::Down(_) | MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+                        app.on_mouse(m)
+                    }
+                    _ => continue,
+                },
                 Some(Ok(_)) => Vec::new(),
                 Some(Err(e)) => return Err(e).context("Failed to read terminal input"),
                 None => break,

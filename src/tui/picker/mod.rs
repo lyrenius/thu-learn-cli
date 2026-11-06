@@ -6,8 +6,8 @@
 //! Deliberate differences from yazi, because the picker chooses one file to
 //! upload: `Enter` on a directory enters it (yazi would choose the directory),
 //! choosing more than one file is refused, file-changing actions, shell
-//! commands, tabs, and plugins are unavailable, and dragging a file into the
-//! terminal chooses it.
+//! commands, tabs, and plugins are unavailable, dragging a file into the
+//! terminal chooses it, and the mouse is ignored while a popup is open.
 
 pub mod editor;
 pub mod fs;
@@ -23,7 +23,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::{Position, Rect};
 
 use editor::{Edit, Editor, Mode};
 use fs::{Entry, Preview, SortBy, Sorter};
@@ -298,6 +299,14 @@ pub enum Outcome {
     Copy(String),
 }
 
+/// Column areas from the last draw, for mouse hit-testing.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Areas {
+    pub parent: Rect,
+    pub current: Rect,
+    pub preview: Rect,
+}
+
 #[derive(Debug, Clone)]
 pub struct Picker {
     pub cwd: PathBuf,
@@ -325,6 +334,8 @@ pub struct Picker {
     pub counts: HashMap<PathBuf, usize>,
     /// Rows of the help list, set by the view.
     pub help_limit: usize,
+    /// Set by the view.
+    pub areas: Areas,
     /// Text shared by input yank/cut/paste and the copy keys.
     clipboard: String,
     last_refresh: Instant,
@@ -401,6 +412,7 @@ impl Picker {
             history: Vec::new(),
             counts: HashMap::new(),
             help_limit: HELP_ROWS,
+            areas: Areas::default(),
             clipboard: String::new(),
             last_refresh: Instant::now(),
         };
@@ -883,6 +895,80 @@ impl Picker {
                 Resolved::Pending | Resolved::Unbound => Outcome::Continue,
             },
         }
+    }
+
+    /// yazi's default mouse handling (`click` and `scroll` from the preset
+    /// `Current`, `Parent`, and `Preview` components).
+    pub fn on_mouse(&mut self, event: MouseEvent) -> Outcome {
+        if self.popup.is_some() {
+            return Outcome::Continue;
+        }
+        let pos = Position::new(event.column, event.row);
+        let step = match event.kind {
+            MouseEventKind::ScrollDown => 1,
+            MouseEventKind::ScrollUp => -1,
+            MouseEventKind::Down(_) => 0,
+            _ => return Outcome::Continue,
+        };
+        self.pending.clear();
+        let areas = self.areas;
+        let button = match event.kind {
+            MouseEventKind::Down(b) => Some(b),
+            _ => None,
+        };
+        if areas.current.contains(pos) {
+            let Some(button) = button else {
+                self.arrow(Step::Offset(step as isize));
+                return Outcome::Continue;
+            };
+            // Clicks hover the entry; a right click also opens it.
+            let row = self.current.scroll.offset + (pos.y - areas.current.y) as usize;
+            if button == MouseButton::Middle || row >= self.current.items.len() {
+                return Outcome::Continue;
+            }
+            self.arrow(Step::Offset(
+                row as isize - self.current.scroll.cursor as isize,
+            ));
+            if button == MouseButton::Right {
+                return self.run(Action::Open, "Open");
+            }
+        } else if areas.parent.contains(pos) {
+            // Scrolling the parent does nothing; a left click reveals the
+            // entry, or leaves the folder below the last one.
+            if button != Some(MouseButton::Left) {
+                return Outcome::Continue;
+            }
+            let row = (pos.y - areas.parent.y) as usize;
+            let entry = self
+                .parent
+                .as_ref()
+                .and_then(|p| p.items.get(p.scroll.offset + row))
+                .map(|e| e.path.clone());
+            match entry {
+                Some(path) => self.reveal(&path),
+                None => return self.run(Action::Leave, "Leave"),
+            }
+        } else if areas.preview.contains(pos) {
+            let Some(button) = button else {
+                self.seek(step);
+                return Outcome::Continue;
+            };
+            // A click reveals an entry of a previewed folder, or enters the
+            // hovered folder below its last entry.
+            if button == MouseButton::Middle {
+                return Outcome::Continue;
+            }
+            let row = (pos.y - areas.preview.y) as usize;
+            let entry = self.preview.as_ref().and_then(|p| match &p.content {
+                PreviewContent::Dir(folder) => folder.items.get(p.skip + row),
+                PreviewContent::File(_) => None,
+            });
+            match entry.map(|e| e.path.clone()) {
+                Some(path) => self.reveal(&path),
+                None => return self.run(Action::Enter, "Enter"),
+            }
+        }
+        Outcome::Continue
     }
 
     fn run(&mut self, action: Action, desc: &str) -> Outcome {

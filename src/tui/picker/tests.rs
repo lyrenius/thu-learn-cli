@@ -1,7 +1,7 @@
 //! Behaviour tests against yazi's documented semantics, on temporary directories.
 
 use super::*;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 
@@ -700,4 +700,105 @@ fn tiny_terminals_do_not_panic() {
         }
     }
     p.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+}
+
+fn mouse(p: &mut Picker, kind: MouseEventKind, (column, row): (u16, u16)) -> Outcome {
+    p.on_mouse(MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    })
+}
+
+fn click(p: &mut Picker, at: (u16, u16)) -> Outcome {
+    mouse(p, MouseEventKind::Down(MouseButton::Left), at)
+}
+
+/// Cell position of the first `needle` on screen (fixture names are narrow).
+fn find(screen: &str, needle: &str) -> (u16, u16) {
+    screen
+        .lines()
+        .enumerate()
+        .find_map(|(y, line)| {
+            let byte = line.find(needle)?;
+            Some((line[..byte].chars().count() as u16, y as u16))
+        })
+        .unwrap_or_else(|| panic!("{needle:?} not on screen:\n{screen}"))
+}
+
+fn hovered_name(p: &Picker) -> String {
+    p.hovered().map(|e| e.name.clone()).unwrap_or_default()
+}
+
+#[test]
+fn mouse_follows_yazi_click_and_scroll() {
+    let fx = Fixture::new("mouse");
+    let mut p = fx.picker();
+    let screen = render(&mut p, 120, 16);
+
+    // In the current column a click hovers, the wheel moves one entry, and a
+    // middle click does nothing.
+    let notes = find(&screen, "notes.txt");
+    click(&mut p, notes);
+    assert_eq!(hovered_name(&p), "notes.txt");
+    let names: Vec<String> = p.current.items.iter().map(|e| e.name.clone()).collect();
+    let i = names.iter().position(|n| n == "notes.txt").unwrap();
+    mouse(&mut p, MouseEventKind::ScrollDown, notes);
+    assert_eq!(hovered_name(&p), names[i + 1]);
+    mouse(&mut p, MouseEventKind::ScrollUp, notes);
+    mouse(
+        &mut p,
+        MouseEventKind::Down(MouseButton::Middle),
+        find(&screen, "answer.pdf"),
+    );
+    assert_eq!(hovered_name(&p), "notes.txt");
+
+    // The wheel over a file preview seeks it.
+    render(&mut p, 120, 16);
+    let preview = (p.areas.preview.x + 2, p.areas.preview.y + 2);
+    mouse(&mut p, MouseEventKind::ScrollDown, preview);
+    assert!(p.preview.as_ref().unwrap().skip > 0);
+
+    // A right click opens the entry: a file asks for the comment, and the
+    // mouse is ignored while that popup is open.
+    mouse(
+        &mut p,
+        MouseEventKind::Down(MouseButton::Right),
+        find(&screen, "answer.pdf"),
+    );
+    assert!(matches!(p.popup, Some(Popup::Input { .. })));
+    click(&mut p, notes);
+    assert_eq!(hovered_name(&p), "answer.pdf");
+    key(&mut p, KeyCode::Esc);
+    key(&mut p, KeyCode::Esc);
+    assert!(p.popup.is_none());
+
+    // A click on an entry of a previewed folder reveals it.
+    click(&mut p, find(&screen, "Slides"));
+    let screen = render(&mut p, 120, 16);
+    click(&mut p, find(&screen, "lecture1.pdf"));
+    assert_eq!(p.cwd, fx.dir.join("Slides"));
+    assert_eq!(hovered_name(&p), "lecture1.pdf");
+
+    // In the parent column a click reveals an entry.
+    let screen = render(&mut p, 120, 16);
+    click(&mut p, find(&screen, "answer.pdf"));
+    assert_eq!(p.cwd, fx.dir);
+    assert_eq!(hovered_name(&p), "answer.pdf");
+
+    // A right click on a folder enters it; a click below the parent
+    // column's last entry leaves it again.
+    let screen = render(&mut p, 120, 16);
+    mouse(
+        &mut p,
+        MouseEventKind::Down(MouseButton::Right),
+        find(&screen, "Slides"),
+    );
+    assert_eq!(p.cwd, fx.dir.join("Slides"));
+    render(&mut p, 120, 16);
+    let parent = p.areas.parent;
+    click(&mut p, (parent.x, parent.y + parent.height - 1));
+    assert_eq!(p.cwd, fx.dir);
+    assert_eq!(hovered_name(&p), "Slides");
 }

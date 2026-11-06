@@ -2,6 +2,7 @@
 //! the only writes back are scroll bookkeeping the layout decides.
 
 use chrono::{DateTime, Local};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Margin, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span, Text};
@@ -13,8 +14,8 @@ use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::app::{
-    is_overdue, AnnouncementFilter, App, DetailState, HomeworkFilter, Overlay, Session, StatusKind,
-    SubmitState, Tab,
+    is_overdue, AnnouncementFilter, App, DetailState, Hits, HomeworkFilter, Overlay, Session,
+    StatusKind, SubmitState, Tab,
 };
 use super::picker::view as picker_view;
 use crate::cli::strip_terminal_controls;
@@ -154,6 +155,7 @@ fn attachment_section(section: &str) -> &str {
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     app.sync_detail_key();
+    app.hits = Hits::default();
     let [header, body, status, keys] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Fill(1),
@@ -198,7 +200,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 submit.picker.notices.clear();
                 draw_submit(f, submit);
             }
-            draw_confirm(f, title, lines)
+            (app.hits.yes, app.hits.no) = draw_confirm(f, title, lines);
         }
         Some(Overlay::DownloadDir { input, error }) => {
             draw_download_dir(f, input, error.as_deref())
@@ -210,7 +212,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
 // ---------- Chrome ----------
 
-fn draw_header(f: &mut Frame, app: &App, area: Rect) {
+fn draw_header(f: &mut Frame, app: &mut App, area: Rect) {
     let spinner = if app.is_busy() {
         SPINNER[app.spinner % SPINNER.len()]
     } else {
@@ -234,18 +236,32 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
             Span::raw("")
         }
     };
-    let titles = Tab::ALL.iter().map(|tab| {
-        let num = Span::styled(format!("{} ", tab.index() + 1), muted());
-        let extra = match tab {
-            Tab::Homework => badge(app.pending_count(None), Color::Yellow),
-            Tab::Announcements => badge(app.unread_count(None), ACCENT),
-            Tab::Files => Span::raw(""),
-            Tab::Courses => Span::raw(""),
-        };
-        Line::from(vec![num, Span::raw(tab.title()), extra])
-    });
+    let titles: Vec<Line<'static>> = Tab::ALL
+        .iter()
+        .map(|tab| {
+            let num = Span::styled(format!("{} ", tab.index() + 1), muted());
+            let extra = match tab {
+                Tab::Homework => badge(app.pending_count(None), Color::Yellow),
+                Tab::Announcements => badge(app.unread_count(None), ACCENT),
+                Tab::Files => Span::raw(""),
+                Tab::Courses => Span::raw(""),
+            };
+            Line::from(vec![num, Span::raw(tab.title()), extra])
+        })
+        .collect();
     let [brand, tabs_area] =
         Layout::horizontal([Constraint::Length(11), Constraint::Fill(1)]).areas(left);
+    if ready {
+        // `Tabs` draws each title with one cell of padding on both sides and a
+        // one-cell divider in between.
+        let mut x = tabs_area.x;
+        for (tab, title) in Tab::ALL.iter().zip(&titles) {
+            let width = title.width() as u16 + 2;
+            let rect = Rect::new(x, tabs_area.y, width, 1).intersection(tabs_area);
+            app.hits.tabs.push((rect, *tab));
+            x = x.saturating_add(width + 1);
+        }
+    }
     f.render_widget(
         Paragraph::new(Span::styled(" thu-learn", Style::new().fg(ACCENT).bold())),
         brand,
@@ -304,7 +320,7 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-fn draw_keys(f: &mut Frame, app: &App, area: Rect) {
+fn draw_keys(f: &mut Frame, app: &mut App, area: Rect) {
     let hints: Vec<(&str, &str)> = if let Some(overlay) = &app.overlay {
         match overlay {
             Overlay::Help => vec![("Esc", "close")],
@@ -363,8 +379,45 @@ fn draw_keys(f: &mut Frame, app: &App, area: Rect) {
             }
         }
     };
-    let (spans, _) = fit_hints(&hints, area.width as usize);
+    let (spans, cells) = fit_hints(&hints, area.width as usize);
     f.render_widget(Paragraph::new(Line::from(spans)), area);
+    // The picker covers this bar, its confirmation included.
+    let covered = matches!(
+        app.overlay,
+        Some(Overlay::Submit(_) | Overlay::Confirm { back: Some(_), .. })
+    );
+    if !covered {
+        for (x, width, label) in cells {
+            if let Some(key) = hint_key(label) {
+                let rect = Rect::new(area.x + x, area.y, width, 1).intersection(area);
+                app.hits.keys.push((rect, key));
+            }
+        }
+    }
+}
+
+/// The key a hint stands for, so clicking the hint can press it. Hints for
+/// several keys, such as `↑↓`, have none.
+fn hint_key(label: &str) -> Option<KeyEvent> {
+    let code = match label {
+        "⏎" => KeyCode::Enter,
+        "Esc" => KeyCode::Esc,
+        "Tab" => KeyCode::Tab,
+        "Space" => KeyCode::Char(' '),
+        _ => {
+            let mut chars = label.chars();
+            match (chars.next(), chars.next()) {
+                (Some(c), None) if c.is_ascii_graphic() => KeyCode::Char(c),
+                _ => return None,
+            }
+        }
+    };
+    Some(KeyEvent::new(code, KeyModifiers::NONE))
+}
+
+/// Width of a hint without its trailing spaces: the part a click hits.
+fn hint_width(key: &str, desc: &str) -> u16 {
+    (UnicodeWidthStr::width(key) + 1 + UnicodeWidthStr::width(desc)) as u16
 }
 
 fn download_hint(app: &App) -> &'static str {
@@ -377,7 +430,11 @@ fn download_hint(app: &App) -> &'static str {
 
 /// Lays out key hints in `width` cells. Trailing `?`, `q`, and `Esc` hints are
 /// kept when space runs out; middle hints are dropped whole instead of cut.
-fn fit_hints(hints: &[(&str, &str)], width: usize) -> (Vec<Span<'static>>, usize) {
+/// Also returns the column, width, and key label of each hint shown.
+fn fit_hints<'a>(
+    hints: &[(&'a str, &str)],
+    width: usize,
+) -> (Vec<Span<'static>>, Vec<(u16, u16, &'a str)>) {
     let w = |(k, d): &(&str, &str)| UnicodeWidthStr::width(*k) + UnicodeWidthStr::width(*d) + 3;
     let pinned_from = hints
         .iter()
@@ -404,10 +461,14 @@ fn fit_hints(hints: &[(&str, &str)], width: usize) -> (Vec<Span<'static>>, usize
         kept.push(h);
     }
     let mut spans = vec![Span::raw(" ")];
-    for (k, d) in kept.iter().copied() {
+    let mut cells = Vec::new();
+    let mut x = 1;
+    for &(k, d) in kept {
         spans.extend(key_hint(k, d));
+        cells.push((x, hint_width(k, d), k));
+        x += hint_width(k, d) + 2;
     }
-    (spans, used)
+    (spans, cells)
 }
 
 // ---------- Lists ----------
@@ -479,6 +540,7 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect, table: ListTable) {
         loading,
     } = table;
     let tab = app.tab;
+    app.hits.list = area;
     let total = rows.len();
     let selected = app.selected_index(tab);
     let count = match selected {
@@ -512,6 +574,13 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect, table: ListTable) {
         .highlight_symbol("▌");
     // Borders and the header row are not list rows.
     app.list_height = area.height.saturating_sub(3) as usize;
+    app.hits.rows = Rect {
+        x: area.x + 1,
+        y: area.y + 2,
+        width: area.width.saturating_sub(2),
+        height: app.list_height as u16,
+    }
+    .intersection(area);
     let mut state = TableState::default()
         .with_offset(app.offsets[tab.index()])
         .with_selected(selected);
@@ -755,6 +824,7 @@ fn draw_course_list(f: &mut Frame, app: &mut App, area: Rect) {
 // ---------- Details ----------
 
 fn draw_detail(f: &mut Frame, app: &mut App, area: Rect) {
+    app.hits.detail = area;
     let title = if app.zoomed {
         Line::styled(" Details ", Style::new().fg(Color::White).bold())
     } else {
@@ -772,19 +842,52 @@ fn draw_detail(f: &mut Frame, app: &mut App, area: Rect) {
             .selected_homework()
             .map(|h| homework_detail(app, h, width)),
         Tab::Announcements => app.selected_announcement().map(announcement_detail),
-        Tab::Files => app.selected_file().map(|x| file_detail(app, x, width)),
+        Tab::Files => app.selected_file().map(|x| file_detail(x, width)),
         Tab::Courses => app.selected_course().map(|c| course_detail(app, c, width)),
     };
-    let Some(lines) = lines else {
+    let Some(mut lines) = lines else {
         f.render_widget(b, area);
         return;
     };
+    let actions = detail_actions(app);
+    let action_line = (!actions.is_empty()).then(|| {
+        let spans: Vec<Span<'static>> = actions.iter().flat_map(|(k, d)| key_hint(k, d)).collect();
+        Line::from(spans)
+    });
+    if let Some(line) = &action_line {
+        lines.push(Line::raw(""));
+        lines.push(line.clone());
+    }
 
     let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
     let total = paragraph.line_count(inner.width) as u16;
     app.detail_height = inner.height;
     app.detail_max_scroll = total.saturating_sub(inner.height);
     app.detail_scroll = app.detail_scroll.min(app.detail_max_scroll);
+    if let Some(line) = action_line {
+        // The actions are the last line. Only its first row can be clicked,
+        // so an action after one that wraps is left out.
+        let rows = Paragraph::new(line)
+            .wrap(Wrap { trim: false })
+            .line_count(inner.width) as u16;
+        let row = total - rows;
+        let y = row
+            .checked_sub(app.detail_scroll)
+            .filter(|y| *y < inner.height);
+        let mut x = 0;
+        for (k, d) in actions.iter().take_while(|_| y.is_some()) {
+            if x >= inner.width {
+                break;
+            }
+            let width = hint_width(k, d).min(inner.width - x);
+            if let (Some(key), Some(y)) = (hint_key(k), y) {
+                app.hits
+                    .actions
+                    .push((Rect::new(inner.x + x, inner.y + y, width, 1), key));
+            }
+            x = x.saturating_add(hint_width(k, d) + 2);
+        }
+    }
     if app.detail_max_scroll > 0 {
         let pct = (app.detail_scroll as usize * 100) / app.detail_max_scroll.max(1) as usize;
         b = b.title_bottom(Line::styled(format!(" {pct}% "), muted()).right_aligned());
@@ -820,6 +923,38 @@ const SECTION_INDENT: usize = 2;
 
 /// Pads `label` to `width` terminal cells, always leaving at least [`LABEL_GAP`]
 /// spaces so a long label never runs into the value after it.
+/// Actions for the selected item, shown as key hints at the end of its details.
+fn detail_actions(app: &App) -> Vec<(&'static str, String)> {
+    match app.tab {
+        Tab::Homework => {
+            let detail = app
+                .selected_homework()
+                .and_then(|h| app.details.get(&h.student_homework_id));
+            let Some(DetailState::Loaded(d)) = detail else {
+                return Vec::new();
+            };
+            let mut actions = Vec::new();
+            if !d.attachments.is_empty() {
+                actions.push(("d", "download all".to_string()));
+            }
+            actions.push(("s", "submit a file".to_string()));
+            actions
+        }
+        Tab::Files if app.selected_file().is_some() => {
+            let dir = app.download_dir.display();
+            let desc = match app.marked_files().len() {
+                0 => format!("download to {dir}"),
+                n => format!("download {n} selected to {dir}, one folder per course"),
+            };
+            vec![("d", desc)]
+        }
+        Tab::Courses if app.selected_course().is_some() => {
+            vec![("⏎", "show this course's homework".to_string())]
+        }
+        _ => Vec::new(),
+    }
+}
+
 fn pad_label(label: &str, width: usize) -> String {
     let gap = width
         .saturating_sub(UnicodeWidthStr::width(label))
@@ -1030,13 +1165,6 @@ fn homework_detail(app: &App, h: &Homework, width: usize) -> Vec<Line<'static>> 
                     .collect();
                 push_section(&mut lines, "Attachments", rows, width);
             }
-            lines.push(Line::raw(""));
-            let mut hint = Vec::new();
-            if !d.attachments.is_empty() {
-                hint.extend(key_hint("d", "download all"));
-            }
-            hint.extend(key_hint("s", "submit a file"));
-            lines.push(Line::from(hint));
         }
     }
     lines
@@ -1064,7 +1192,7 @@ fn announcement_detail(n: &Notification) -> Vec<Line<'static>> {
     lines
 }
 
-fn file_detail(app: &App, x: &CourseFile, width: usize) -> Vec<Line<'static>> {
+fn file_detail(x: &CourseFile, width: usize) -> Vec<Line<'static>> {
     let mut lines = title_lines(
         &x.title,
         vec![
@@ -1084,21 +1212,6 @@ fn file_detail(app: &App, x: &CourseFile, width: usize) -> Vec<Line<'static>> {
             width,
         );
     }
-    lines.push(Line::raw(""));
-    let selected = app.marked_files().len();
-    let mut hint = if selected == 0 {
-        key_hint("d", "download to")
-    } else {
-        key_hint("d", &format!("download {selected} selected to"))
-    };
-    hint.push(Span::styled(
-        app.download_dir.display().to_string(),
-        muted(),
-    ));
-    if selected > 0 {
-        hint.push(Span::styled(", one folder per course", muted()));
-    }
-    lines.push(Line::from(hint));
     lines
 }
 
@@ -1169,8 +1282,6 @@ fn course_detail(app: &App, c: &Course, width: usize) -> Vec<Line<'static>> {
         "Files",
         vec![Span::raw(app.file_count(Some(&c.id)).to_string())],
     ));
-    lines.push(Line::raw(""));
-    lines.push(Line::from(key_hint("⏎", "show this course's homework")));
     lines
 }
 
@@ -1338,7 +1449,7 @@ fn draw_help(f: &mut Frame, app: &App) {
     );
 }
 
-fn draw_course_picker(f: &mut Frame, app: &App, selected: usize) {
+fn draw_course_picker(f: &mut Frame, app: &mut App, selected: usize) {
     let mut items = vec![ListItem::new(Line::from(vec![Span::raw("All courses")]))];
     for c in &app.courses.current {
         let pending = app.pending_count(Some(&c.id));
@@ -1362,12 +1473,14 @@ fn draw_course_picker(f: &mut Frame, app: &App, selected: usize) {
         .min(f.area().height.saturating_sub(4))
         .max(5);
     let (area, b) = popup(f, 60, height, "Course");
+    app.hits.courses = b.inner(area);
     let list = List::new(items)
         .block(b)
         .highlight_style(Style::new().bg(Color::DarkGray).fg(Color::White).bold())
         .highlight_symbol("▌ ");
     let mut state = ListState::default().with_selected(Some(selected));
     f.render_stateful_widget(list, area, &mut state);
+    app.hits.courses_offset = state.offset();
 }
 
 fn input_line(f: &mut Frame, area: Rect, label: &str, input: &super::input::Input, active: bool) {
@@ -1404,7 +1517,8 @@ fn draw_submit(f: &mut Frame, submit: &mut SubmitState) {
 }
 
 /// A confirmation in yazi's style: centred title, body, and `[Y]es`/`(N)o`.
-fn draw_confirm(f: &mut Frame, title: &str, lines: &[String]) {
+/// Returns the button areas.
+fn draw_confirm(f: &mut Frame, title: &str, lines: &[String]) -> (Rect, Rect) {
     let width = f.area().width.saturating_sub(4).min(70);
     let text: Vec<Line<'static>> = lines.iter().map(|l| Line::raw(clean(l))).collect();
     let body = Paragraph::new(Text::from(text)).wrap(Wrap { trim: false });
@@ -1445,6 +1559,7 @@ fn draw_confirm(f: &mut Frame, title: &str, lines: &[String]) {
         .centered(),
         no,
     );
+    (yes, no)
 }
 
 fn draw_download_dir(f: &mut Frame, input: &super::input::Input, error: Option<&str>) {
@@ -1466,6 +1581,10 @@ fn draw_download_dir(f: &mut Frame, input: &super::input::Input, error: Option<&
 mod tests {
     use super::*;
     use crate::tui::app::tests::{files_app, local_dt, ready_app};
+    use crate::tui::app::Effect;
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -1688,8 +1807,6 @@ mod tests {
 
     #[test]
     fn selected_files_get_yazi_markers_and_a_count() {
-        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-
         let mut app = files_app();
         app.selected_files = ["f4", "f2"].into_iter().map(String::from).collect();
         let screen = render(&mut app, 120, 20);
@@ -1709,5 +1826,145 @@ mod tests {
         let screen = render(&mut app, 120, 20);
         assert!(screen.contains("2 selected  SEL"), "{screen}");
         assert!(screen.contains("Esc apply"), "{screen}");
+    }
+
+    fn mouse(kind: MouseEventKind, (column, row): (u16, u16)) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn click(at: (u16, u16)) -> MouseEvent {
+        mouse(MouseEventKind::Down(MouseButton::Left), at)
+    }
+
+    /// Cell position of `needle` on screen; the fixtures use narrow characters only.
+    fn find(screen: &str, needle: &str) -> (u16, u16) {
+        screen
+            .lines()
+            .enumerate()
+            .find_map(|(y, line)| {
+                let byte = line.find(needle)?;
+                Some((line[..byte].chars().count() as u16, y as u16))
+            })
+            .unwrap_or_else(|| panic!("{needle:?} not on screen:\n{screen}"))
+    }
+
+    #[test]
+    fn mouse_switches_tabs_selects_rows_and_scrolls() {
+        let mut app = ready_app();
+        app.homework_filter = HomeworkFilter::All;
+        let screen = render(&mut app, 120, 20);
+        // Rows start below the list's top border and header: y = 3 is the first.
+        app.on_mouse(click((10, 4)));
+        assert_eq!(app.selected_index(Tab::Homework), Some(1));
+        app.on_mouse(mouse(MouseEventKind::ScrollDown, (10, 10)));
+        assert_eq!(app.selected_index(Tab::Homework), Some(2));
+        // Below the last row nothing is selected.
+        app.on_mouse(click((10, 15)));
+        assert_eq!(app.selected_index(Tab::Homework), Some(2));
+
+        // The wheel over the details scrolls them, not the list.
+        render(&mut app, 120, 20);
+        app.detail_max_scroll = 10;
+        app.on_mouse(mouse(MouseEventKind::ScrollDown, (100, 10)));
+        assert_eq!(app.detail_scroll, 3);
+        assert_eq!(app.selected_index(Tab::Homework), Some(2));
+
+        // A right click opens the row, like Enter.
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Right), (10, 3)));
+        assert!(app.zoomed);
+        assert_eq!(app.selected_index(Tab::Homework), Some(0));
+        app.zoomed = false;
+
+        app.on_mouse(click(find(&screen, "3 Files")));
+        assert_eq!(app.tab, Tab::Files);
+        render(&mut app, 120, 20);
+        // The divider between tabs is not a tab.
+        let (x, y) = find(&screen, "│ 4 Courses");
+        app.on_mouse(click((x, y)));
+        assert_eq!(app.tab, Tab::Files);
+        app.on_mouse(click((x + 3, y)));
+        assert_eq!(app.tab, Tab::Courses);
+    }
+
+    #[test]
+    fn mouse_clicks_course_picker_rows_and_confirm_buttons() {
+        let mut app = ready_app();
+        app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        let screen = render(&mut app, 120, 20);
+        app.on_mouse(mouse(MouseEventKind::ScrollDown, (0, 0)));
+        assert!(matches!(
+            app.overlay,
+            Some(Overlay::CoursePicker { selected: 1 })
+        ));
+        app.on_mouse(click(find(&screen, "Networks")));
+        assert!(app.overlay.is_none());
+        assert_eq!(app.course_filter.as_deref(), Some("c2"));
+
+        let mut app = files_app();
+        app.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        let screen = render(&mut app, 120, 20);
+        // Clicks elsewhere keep the confirmation open.
+        app.on_mouse(click((0, 0)));
+        assert!(matches!(app.overlay, Some(Overlay::Confirm { .. })));
+        let effects = app.on_mouse(click(find(&screen, "[Y]es")));
+        assert!(
+            matches!(effects.as_slice(), [Effect::DownloadFiles { .. }]),
+            "{effects:?}"
+        );
+    }
+
+    #[test]
+    fn clicking_a_hint_presses_its_key() {
+        use crate::models::HomeworkAttachment;
+        use crate::tui::app::HomeworkDetail;
+        use std::path::PathBuf;
+
+        let mut app = ready_app();
+        let attachment = HomeworkAttachment {
+            section: "作业附件".into(),
+            filename: "spec.pdf".into(),
+            download_path: "https://learn.tsinghua.edu.cn/x".into(),
+        };
+        app.details.insert(
+            "soon".into(),
+            DetailState::Loaded(HomeworkDetail {
+                description: String::new(),
+                attachments: vec![attachment.clone()],
+            }),
+        );
+        let screen = render(&mut app, 120, 20);
+        let effects = app.on_mouse(click(find(&screen, "d download all")));
+        assert_eq!(
+            effects,
+            vec![Effect::DownloadAttachments {
+                attachments: vec![attachment],
+                dir: PathBuf::from("/tmp/downloads"),
+            }]
+        );
+        // The gap before a hint is not part of it.
+        let (x, y) = find(&screen, "s submit a file");
+        app.on_mouse(click((x - 1, y)));
+        assert!(app.overlay.is_none());
+        app.submit_dir = std::env::temp_dir();
+        app.on_mouse(click((x, y)));
+        assert!(matches!(app.overlay, Some(Overlay::Submit(_))));
+        // The picker covers the key bar, so its hints are not clickable there.
+        render(&mut app, 120, 20);
+        assert!(app.hits.keys.is_empty());
+        app.overlay = None;
+
+        // In the key bar, "/ search" starts a search and "Esc clear" ends it.
+        let screen = render(&mut app, 120, 20);
+        app.on_mouse(click(find(&screen, "/ search")));
+        assert!(app.searching);
+        let screen = render(&mut app, 120, 20);
+        app.on_mouse(click(find(&screen, "Esc clear")));
+        assert!(!app.searching);
     }
 }

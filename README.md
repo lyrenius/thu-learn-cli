@@ -52,6 +52,8 @@ The screen shows a list on the left and details for the selected item on the rig
 | `r` | Refresh from Learn |
 | `?` / `q` | Help / quit |
 
+The mouse works as in yazi: click a tab to switch to it, click a row to select it, right-click a row to open it, and use the wheel to move through the list or scroll the details. Clicking a key hint presses its key, such as `s submit a file` at the end of a homework's details or `/ search` in the bottom bar. Course choices and the `[Y]es`/`(N)o` buttons can be clicked too. While the TUI is open, the terminal's own text selection needs a modifier key: Shift in most terminals, Option in iTerm2 and Terminal.app.
+
 ### Submission picker
 
 Submitting opens a file picker that looks and behaves like [yazi](https://github.com/sxyazi/yazi) with its default keymap: parent, current, and preview columns (1:4:3), yazi's header and status bar, and the same keys. Press `~` or `F1` inside the picker for the full list.
@@ -76,9 +78,11 @@ Submitting opens a file picker that looks and behaves like [yazi](https://github
 | `Tab` | File details (spot) |
 | `q`, `C-c` | Cancel the submission |
 
+The mouse also follows yazi's defaults: in the middle column a click hovers a file, a right click chooses it (or enters a folder), and the wheel moves the cursor; a click in the left column goes to that entry (below the last one, to the parent folder); a click in the preview opens the folder at that entry, and the wheel scrolls the preview.
+
 Input popups work like yazi's: they open in insert mode, `Esc` switches to a vi-style normal mode, and a second `Esc` closes them. Yanked or cut text goes to the system clipboard, and `p`/`P` paste text yanked, cut, or copied inside the picker (they do not read the system clipboard). After choosing a file, type an optional comment and press `Enter`; the confirmation shows the course, homework, file, and size before anything is sent, and `n` returns to the picker as you left it. Dragging a file into the terminal chooses it.
 
-Differences from yazi, because the picker uploads exactly one file: `Enter` on a folder enters it instead of choosing it, choosing more than one file is refused, and keys that change files, run shell commands, use tabs, or call plugins (fd, rg, fzf, zoxide) show a notice instead. Folder listings refresh about once a second while the picker is open. The picker opens in the download folder and then remembers the last folder you submitted from.
+Differences from yazi, because the picker uploads exactly one file: `Enter` on a folder enters it instead of choosing it, choosing more than one file is refused, and keys that change files, run shell commands, use tabs, or call plugins (fd, rg, fzf, zoxide) show a notice instead, and the mouse is ignored while a popup is open. Folder listings refresh about once a second while the picker is open. The picker opens in the download folder and then remembers the last folder you submitted from.
 
 Downloads go to the current directory unless `--dir` or `D` says otherwise, and never overwrite an existing file (a ` (1)` suffix is added). Downloading selected files asks first, saves them into one folder per course (for example `Networks/Lab 1.pdf`), and fetches four at a time. Detail panes show each item's short ID so it can be passed to CLI commands.
 
