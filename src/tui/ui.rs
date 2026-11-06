@@ -715,12 +715,6 @@ fn draw_course_list(f: &mut Frame, app: &mut App, area: Rect) {
 // ---------- Details ----------
 
 fn draw_detail(f: &mut Frame, app: &mut App, area: Rect) {
-    let lines = match app.tab {
-        Tab::Homework => app.selected_homework().map(|h| homework_detail(app, h)),
-        Tab::Announcements => app.selected_announcement().map(announcement_detail),
-        Tab::Files => app.selected_file().map(|x| file_detail(app, x)),
-        Tab::Courses => app.selected_course().map(|c| course_detail(app, c)),
-    };
     let title = if app.zoomed {
         Line::styled(" Details ", Style::new().fg(Color::White).bold())
     } else {
@@ -730,12 +724,22 @@ fn draw_detail(f: &mut Frame, app: &mut App, area: Rect) {
     if app.zoomed {
         b = b.border_style(Style::new().fg(ACCENT));
     }
+    let inner = b.inner(area).inner(Margin::new(1, 0));
+    // Sections wrap their bodies to this width themselves to keep them indented.
+    let width = inner.width as usize;
+    let lines = match app.tab {
+        Tab::Homework => app
+            .selected_homework()
+            .map(|h| homework_detail(app, h, width)),
+        Tab::Announcements => app.selected_announcement().map(announcement_detail),
+        Tab::Files => app.selected_file().map(|x| file_detail(app, x, width)),
+        Tab::Courses => app.selected_course().map(|c| course_detail(app, c, width)),
+    };
     let Some(lines) = lines else {
         f.render_widget(b, area);
         return;
     };
 
-    let inner = b.inner(area).inner(Margin::new(1, 0));
     let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
     let total = paragraph.line_count(inner.width) as u16;
     app.detail_height = inner.height;
@@ -767,14 +771,99 @@ fn draw_detail(f: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
-/// Label column of detail fields: the longest label ("Submitted") plus a two-cell gap.
-const FIELD_WIDTH: usize = 11;
+/// Minimum gap between a label and its value in detail panes.
+const LABEL_GAP: usize = 4;
+/// Label column of detail fields: the longest label ("Submitted") plus [`LABEL_GAP`].
+const FIELD_WIDTH: usize = 9 + LABEL_GAP;
+/// Indent of section bodies under their heading.
+const SECTION_INDENT: usize = 2;
 
-/// Pads `label` to `width` terminal cells, always leaving at least two spaces
-/// so a long label never runs into the value after it.
+/// Pads `label` to `width` terminal cells, always leaving at least [`LABEL_GAP`]
+/// spaces so a long label never runs into the value after it.
 fn pad_label(label: &str, width: usize) -> String {
-    let gap = width.saturating_sub(UnicodeWidthStr::width(label)).max(2);
+    let gap = width
+        .saturating_sub(UnicodeWidthStr::width(label))
+        .max(LABEL_GAP);
     format!("{label}{}", " ".repeat(gap))
+}
+
+/// Appends a section: its heading, a blank line, then `body` indented under it.
+/// `width` is the pane's text width, used to keep wrapped rows indented too.
+fn push_section(
+    lines: &mut Vec<Line<'static>>,
+    title: &str,
+    body: Vec<Line<'static>>,
+    width: usize,
+) {
+    lines.push(heading(title));
+    lines.push(Line::raw(""));
+    for line in body {
+        lines.extend(wrap_indented(line, SECTION_INDENT, width));
+    }
+}
+
+/// Wraps `line` to `width` cells and indents every row by `indent` spaces, so the
+/// paragraph's own wrapping never sends a continuation row back to column 0.
+/// Rows break after spaces and around wide (CJK) characters, and inside a word
+/// only when it does not fit on a row by itself.
+fn wrap_indented(line: Line<'static>, indent: usize, width: usize) -> Vec<Line<'static>> {
+    let avail = width.saturating_sub(indent).max(1);
+    let base = line.style;
+    let mut rows: Vec<Vec<(char, Style)>> = Vec::new();
+    let mut row: Vec<(char, Style)> = Vec::new();
+    let mut used = 0;
+    // Length of `row` at the last point where it may be broken.
+    let mut brk: Option<usize> = None;
+    let cells = line.spans.iter().flat_map(|s| {
+        let style = base.patch(s.style);
+        s.content
+            .chars()
+            .map(move |c| (c, style))
+            .collect::<Vec<_>>()
+    });
+    for (c, style) in cells {
+        let w = c.width().unwrap_or(0);
+        while used + w > avail && !row.is_empty() {
+            let rest = brk.take().map(|i| row.split_off(i)).unwrap_or_default();
+            rows.push(std::mem::take(&mut row));
+            row = rest.into_iter().skip_while(|(c, _)| *c == ' ').collect();
+            used = row.iter().map(|(c, _)| c.width().unwrap_or(0)).sum();
+        }
+        if c == ' ' && row.is_empty() && !rows.is_empty() {
+            continue; // No leading spaces on continuation rows.
+        }
+        if w > 1 && !row.is_empty() {
+            brk = Some(row.len());
+        }
+        row.push((c, style));
+        used += w;
+        if c == ' ' || w > 1 {
+            brk = Some(row.len());
+        }
+    }
+    rows.push(row);
+
+    rows.into_iter()
+        .map(|mut row| {
+            while row.last().is_some_and(|(c, _)| *c == ' ') {
+                row.pop();
+            }
+            let Some(&(_, first)) = row.first() else {
+                return Line::raw("");
+            };
+            let mut spans = vec![Span::raw(" ".repeat(indent))];
+            let (mut text, mut style) = (String::new(), first);
+            for (c, s) in row {
+                if s != style {
+                    spans.push(Span::styled(std::mem::take(&mut text), style));
+                    style = s;
+                }
+                text.push(c);
+            }
+            spans.push(Span::styled(text, style));
+            Line::from(spans)
+        })
+        .collect()
 }
 
 fn field(label: &str, value: Vec<Span<'static>>) -> Line<'static> {
@@ -794,7 +883,7 @@ fn title_lines(title: &str, meta: Vec<String>) -> Vec<Line<'static>> {
     lines
 }
 
-fn homework_detail(app: &App, h: &Homework) -> Vec<Line<'static>> {
+fn homework_detail(app: &App, h: &Homework, width: usize) -> Vec<Line<'static>> {
     let now = app.now;
     let mut lines = title_lines(
         &h.title,
@@ -863,36 +952,43 @@ fn homework_detail(app: &App, h: &Homework) -> Vec<Line<'static>> {
         Some(DetailState::Loaded(d)) => {
             if !d.description.trim().is_empty() {
                 lines.push(Line::raw(""));
-                lines.push(heading("Description"));
-                lines.extend(clean_lines(&d.description));
+                push_section(
+                    &mut lines,
+                    "Description",
+                    clean_lines(&d.description),
+                    width,
+                );
             }
             if !h.comment.trim().is_empty() {
                 lines.push(Line::raw(""));
-                lines.push(heading("Grader comment"));
-                lines.extend(clean_lines(&h.comment));
+                push_section(&mut lines, "Grader comment", clean_lines(&h.comment), width);
             }
             lines.push(Line::raw(""));
             if d.attachments.is_empty() {
                 lines.push(Line::styled("No attachments.", muted()));
             } else {
-                lines.push(heading("Attachments"));
                 // Align file names after the widest section label in this list.
-                let width = d
+                let label_width = d
                     .attachments
                     .iter()
                     .map(|a| UnicodeWidthStr::width(attachment_section(&a.section)))
                     .max()
                     .unwrap_or(0)
-                    + 2;
-                for a in &d.attachments {
-                    lines.push(Line::from(vec![
-                        Span::styled(
-                            format!("  {}", pad_label(attachment_section(&a.section), width)),
-                            muted(),
-                        ),
-                        Span::raw(clean(&a.filename)),
-                    ]));
-                }
+                    + LABEL_GAP;
+                let rows = d
+                    .attachments
+                    .iter()
+                    .map(|a| {
+                        Line::from(vec![
+                            Span::styled(
+                                pad_label(attachment_section(&a.section), label_width),
+                                muted(),
+                            ),
+                            Span::raw(clean(&a.filename)),
+                        ])
+                    })
+                    .collect();
+                push_section(&mut lines, "Attachments", rows, width);
             }
             lines.push(Line::raw(""));
             let mut hint = Vec::new();
@@ -928,7 +1024,7 @@ fn announcement_detail(n: &Notification) -> Vec<Line<'static>> {
     lines
 }
 
-fn file_detail(app: &App, x: &CourseFile) -> Vec<Line<'static>> {
+fn file_detail(app: &App, x: &CourseFile, width: usize) -> Vec<Line<'static>> {
     let mut lines = title_lines(
         &x.title,
         vec![
@@ -941,8 +1037,12 @@ fn file_detail(app: &App, x: &CourseFile) -> Vec<Line<'static>> {
     lines.push(field("Uploaded", vec![Span::raw(clean(&x.upload_time))]));
     if !x.description.trim().is_empty() {
         lines.push(Line::raw(""));
-        lines.push(heading("Description"));
-        lines.extend(clean_lines(&x.description));
+        push_section(
+            &mut lines,
+            "Description",
+            clean_lines(&x.description),
+            width,
+        );
     }
     lines.push(Line::raw(""));
     let mut hint = key_hint("d", "download to");
@@ -954,7 +1054,7 @@ fn file_detail(app: &App, x: &CourseFile) -> Vec<Line<'static>> {
     lines
 }
 
-fn course_detail(app: &App, c: &Course) -> Vec<Line<'static>> {
+fn course_detail(app: &App, c: &Course, width: usize) -> Vec<Line<'static>> {
     let mut lines = title_lines(
         &c.name,
         vec![clean(&c.teacher), format!("ID {}", short_id(&c.id))],
@@ -967,9 +1067,10 @@ fn course_detail(app: &App, c: &Course) -> Vec<Line<'static>> {
         .filter(|h| h.course_id == c.id && HomeworkFilter::Pending.matches(h, now))
         .collect();
     pending.sort_by_key(|h| h.deadline);
-    lines.push(heading(&format!("Pending homework ({})", pending.len())));
+    let title = format!("Pending homework ({})", pending.len());
+    let mut rows = Vec::new();
     if pending.is_empty() {
-        lines.push(Line::styled("  Nothing due.", muted()));
+        rows.push(Line::styled("Nothing due.", muted()));
     }
     for h in pending {
         let (due, left) = match h.deadline {
@@ -982,12 +1083,13 @@ fn course_detail(app: &App, c: &Course) -> Vec<Line<'static>> {
             }
             None => (String::from("—"), Span::raw("")),
         };
-        lines.push(Line::from(vec![
-            Span::styled(format!("  {due}  "), muted()),
+        rows.push(Line::from(vec![
+            Span::styled(format!("{due}  "), muted()),
             Span::raw(clean(&h.title)),
             left,
         ]));
     }
+    push_section(&mut lines, &title, rows, width);
 
     let mut notes: Vec<&Notification> = app
         .announcements
@@ -996,10 +1098,9 @@ fn course_detail(app: &App, c: &Course) -> Vec<Line<'static>> {
         .filter(|n| n.course_id == c.id)
         .collect();
     notes.sort_by(|a, b| b.publish_time.cmp(&a.publish_time));
-    lines.push(Line::raw(""));
-    lines.push(heading("Recent announcements"));
+    let mut rows = Vec::new();
     if notes.is_empty() {
-        lines.push(Line::styled("  None.", muted()));
+        rows.push(Line::styled("None.", muted()));
     }
     for n in notes.iter().take(5) {
         let dot = if n.read {
@@ -1007,12 +1108,14 @@ fn course_detail(app: &App, c: &Course) -> Vec<Line<'static>> {
         } else {
             Span::styled("● ", Style::new().fg(ACCENT))
         };
-        lines.push(Line::from(vec![
-            Span::styled(format!("  {}  ", date_only(&n.publish_time)), muted()),
+        rows.push(Line::from(vec![
+            Span::styled(format!("{}  ", date_only(&n.publish_time)), muted()),
             dot,
             Span::raw(clean(&n.title)),
         ]));
     }
+    lines.push(Line::raw(""));
+    push_section(&mut lines, "Recent announcements", rows, width);
     lines.push(Line::raw(""));
     lines.push(field(
         "Files",
@@ -1404,10 +1507,10 @@ mod tests {
 
     #[test]
     fn detail_labels_keep_a_gap_before_values() {
-        assert_eq!(pad_label("Status", FIELD_WIDTH), "Status     ");
-        assert_eq!(pad_label("Submitted", FIELD_WIDTH), "Submitted  ");
-        assert_eq!(pad_label("Longer than width", 10), "Longer than width  ");
-        assert_eq!(pad_label("作业附件", 10), "作业附件  ");
+        assert_eq!(pad_label("Status", FIELD_WIDTH), "Status       ");
+        assert_eq!(pad_label("Submitted", FIELD_WIDTH), "Submitted    ");
+        assert_eq!(pad_label("Longer than width", 10), "Longer than width    ");
+        assert_eq!(pad_label("作业附件", 10), "作业附件    ");
 
         let mut app = ready_app();
         let attachment = |section: &str, filename: &str| crate::models::HomeworkAttachment {
@@ -1418,7 +1521,7 @@ mod tests {
         app.details.insert(
             "soon".into(),
             DetailState::Loaded(crate::tui::app::HomeworkDetail {
-                description: String::new(),
+                description: "二选一完成".into(),
                 // "Attachment" is the parser's fallback when no Learn section label precedes a file.
                 attachments: vec![
                     attachment("作业附件", "spec.pdf"),
@@ -1433,22 +1536,67 @@ mod tests {
             .find(|h| h.student_homework_id == "soon")
             .unwrap()
             .clone();
-        let text: Vec<String> = homework_detail(&app, &h)
+        let text: Vec<String> = homework_detail(&app, &h, 60)
             .iter()
             .map(|l| l.to_string())
             .collect();
         assert!(
-            text.contains(&"Status     Pending".to_string()),
+            text.contains(&"Status       Pending".to_string()),
             "{text:#?}"
         );
-        assert!(
-            text.contains(&"  Homework    spec.pdf".to_string()),
+        // Headings are followed by a blank line, and their bodies are indented.
+        let start = text.iter().position(|l| l == "▍Description").unwrap();
+        assert_eq!(
+            text[start..start + 8],
+            [
+                "▍Description",
+                "",
+                "  二选一完成",
+                "",
+                "▍Attachments",
+                "",
+                "  Homework      spec.pdf",
+                "  Attachment    L8 slides.pptx",
+            ],
             "{text:#?}"
         );
-        assert!(
-            text.contains(&"  Attachment  L8 slides.pptx".to_string()),
-            "{text:#?}"
-        );
+    }
+
+    fn row_texts(lines: &[Line]) -> Vec<String> {
+        lines.iter().map(|l| l.to_string()).collect()
+    }
+
+    #[test]
+    fn wrapped_section_rows_keep_their_indent() {
+        // Words move to the next row whole; every row keeps the indent.
+        let rows = wrap_indented(Line::raw("submit the report as a pdf"), 2, 14);
+        assert_eq!(row_texts(&rows), ["  submit the", "  report as a", "  pdf"]);
+        // CJK text can break between any two characters.
+        let rows = wrap_indented(Line::raw("二选一完成课后作业"), 2, 12);
+        assert_eq!(row_texts(&rows), ["  二选一完成", "  课后作业"]);
+        // A word longer than a row is split.
+        let rows = wrap_indented(Line::raw("abcdefghij"), 2, 6);
+        assert_eq!(row_texts(&rows), ["  abcd", "  efgh", "  ij"]);
+        // Empty lines stay empty instead of holding only the indent.
+        assert_eq!(row_texts(&wrap_indented(Line::raw(""), 2, 10)), [""]);
+        // A pane narrower than the indent still makes progress.
+        assert_eq!(wrap_indented(Line::raw("ab"), 2, 0).len(), 2);
+    }
+
+    #[test]
+    fn wrapped_section_rows_keep_span_styles() {
+        let line = Line::from(vec![
+            Span::styled("Homework    ", muted()),
+            Span::raw("spec.pdf"),
+        ]);
+        let rows = wrap_indented(line, 2, 40);
+        assert_eq!(rows.len(), 1);
+        let spans = &rows[0].spans;
+        assert_eq!(spans[0].content, "  ");
+        assert_eq!(spans[1].content, "Homework    ");
+        assert_eq!(spans[1].style, muted());
+        assert_eq!(spans[2].content, "spec.pdf");
+        assert_eq!(spans[2].style, Style::new());
     }
 
     #[test]
