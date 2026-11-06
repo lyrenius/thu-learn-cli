@@ -244,7 +244,7 @@ fn render_homework_table(
         .iter()
         .map(|h| {
             let course = if h.course_name.is_empty() {
-                "(previous course)"
+                "(unknown course)"
             } else {
                 &h.course_name
             };
@@ -436,6 +436,10 @@ pub struct Cli {
     /// Print JSON output for supported commands.
     #[arg(long, global = true)]
     json: bool,
+    /// Semester to use, such as 2025-2026-1 (1 = fall, 2 = spring, 3 = summer).
+    /// Defaults to Learn's current semester.
+    #[arg(long, global = true, value_name = "ID", value_parser = semester_arg)]
+    semester: Option<String>,
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -544,20 +548,30 @@ enum FileCommands {
     },
 }
 
+/// Clap parser for `--semester`.
+fn semester_arg(s: &str) -> Result<String, String> {
+    if crate::api::is_semester_id(s) {
+        Ok(s.to_string())
+    } else {
+        Err("expected a semester ID such as 2025-2026-1".into())
+    }
+}
+
 pub async fn run() -> Result<()> {
     let cli = Cli::parse();
     let json = cli.json;
+    let sem = cli.semester.as_deref();
     let Some(command) = cli.command else {
         // Humans get the TUI; scripts and agents without a terminal get help text.
         if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() && !json {
-            return cmd_tui(None).await;
+            return cmd_tui(None, sem).await;
         }
         Cli::command().print_help()?;
         println!();
         return Ok(());
     };
     match command {
-        Commands::Tui { dir } => cmd_tui(dir).await,
+        Commands::Tui { dir } => cmd_tui(dir, sem).await,
         Commands::Login {
             username,
             no_remember,
@@ -577,25 +591,25 @@ pub async fn run() -> Result<()> {
             download,
             course,
         } => match id {
-            Some(xszyid) => cmd_homework_show(xszyid, download, json).await,
-            None => cmd_homework(all, overdue, course, json).await,
+            Some(xszyid) => cmd_homework_show(sem, xszyid, download, json).await,
+            None => cmd_homework(sem, all, overdue, course, json).await,
         },
         Commands::Announcement { id, course } => match id {
-            Some(x) => cmd_announcement_show(x, json).await,
-            None => cmd_announcement(course, json).await,
+            Some(x) => cmd_announcement_show(sem, x, json).await,
+            None => cmd_announcement(sem, course, json).await,
         },
-        Commands::Debug => cmd_debug().await,
-        Commands::Courses => cmd_courses(json).await,
+        Commands::Debug => cmd_debug(sem).await,
+        Commands::Courses => cmd_courses(sem, json).await,
         Commands::File { command } => match command {
-            FileCommands::Ls { course } => cmd_file_ls(course, json).await,
-            FileCommands::Show { file_id } => cmd_file_show(file_id, json).await,
-            FileCommands::Get { file_id, out } => cmd_file_get(file_id, out).await,
+            FileCommands::Ls { course } => cmd_file_ls(sem, course, json).await,
+            FileCommands::Show { file_id } => cmd_file_show(sem, file_id, json).await,
+            FileCommands::Get { file_id, out } => cmd_file_get(sem, file_id, out).await,
         },
         Commands::Submit {
             homework_id,
             file,
             comment,
-        } => cmd_submit(homework_id, file, comment).await,
+        } => cmd_submit(sem, homework_id, file, comment).await,
     }
 }
 
@@ -609,16 +623,20 @@ async fn login_only() -> Result<Client> {
     Ok(client)
 }
 
-async fn prepare() -> Result<(Client, Vec<Course>)> {
+/// Logs in and loads the courses of `semester`, or of Learn's current semester.
+async fn prepare(semester: Option<&str>) -> Result<(Client, Vec<Course>)> {
     let client = login_only().await?;
-    let semester = client.current_semester().await?;
+    let semester = match semester {
+        Some(s) => s.to_string(),
+        None => client.current_semester().await?,
+    };
     let courses = client.course_list(&semester).await?;
     Ok((client, courses))
 }
 
 // ---------- Commands ----------
 
-async fn cmd_tui(dir: Option<PathBuf>) -> Result<()> {
+async fn cmd_tui(dir: Option<PathBuf>, semester: Option<&str>) -> Result<()> {
     if !std::io::stdout().is_terminal() {
         anyhow::bail!("The TUI needs an interactive terminal; use the subcommands for scripts.");
     }
@@ -626,7 +644,11 @@ async fn cmd_tui(dir: Option<PathBuf>) -> Result<()> {
         Some(dir) => dir,
         None => std::env::current_dir().context("Could not read the current directory")?,
     };
-    crate::tui::run(crate::tui::Options { download_dir }).await
+    crate::tui::run(crate::tui::Options {
+        download_dir,
+        semester: semester.map(str::to_string),
+    })
+    .await
 }
 
 async fn cmd_login(username: Option<String>, force_browser: bool) -> Result<()> {
@@ -759,40 +781,14 @@ fn prompt_username(default: Option<&str>) -> Result<String> {
     })
 }
 
-/// Returns the previous semester ID used to backfill older homework course names.
-pub(crate) fn prev_semester(s: &str) -> Option<String> {
-    let p: Vec<&str> = s.split('-').collect();
-    if p.len() != 3 {
-        return None;
-    }
-    let (y1, y2, t): (i32, i32, i32) = (p[0].parse().ok()?, p[1].parse().ok()?, p[2].parse().ok()?);
-    if t > 1 {
-        Some(format!("{y1}-{y2}-{}", t - 1))
-    } else {
-        Some(format!("{}-{}-2", y1 - 1, y2 - 1))
-    }
-}
-
-/// Loads current and previous semester courses for cross-semester homework lookup.
-async fn courses_with_prev(client: &Client) -> Result<Vec<Course>> {
-    let sem = client.current_semester().await?;
-    let mut courses = client.course_list(&sem).await?;
-    if let Some(prev) = prev_semester(&sem) {
-        if let Ok(mut pc) = client.course_list(&prev).await {
-            courses.append(&mut pc);
-        }
-    }
-    Ok(courses)
-}
-
 async fn cmd_homework(
+    semester: Option<&str>,
     all: bool,
     overdue: bool,
     course_filter: Option<String>,
     json: bool,
 ) -> Result<()> {
-    let client = login_only().await?;
-    let courses = courses_with_prev(&client).await?;
+    let (client, courses) = prepare(semester).await?;
     let target_course_ids = match course_filter.as_deref() {
         Some(query) => Some(
             filter_courses(&courses, Some(query))?
@@ -848,13 +844,13 @@ async fn cmd_homework(
     Ok(())
 }
 
-async fn cmd_debug() -> Result<()> {
-    let (client, courses) = prepare().await?;
+async fn cmd_debug(semester: Option<&str>) -> Result<()> {
+    let (client, courses) = prepare(semester).await?;
     client.debug_dump(&courses).await
 }
 
-async fn cmd_courses(json: bool) -> Result<()> {
-    let (_, courses) = prepare().await?;
+async fn cmd_courses(semester: Option<&str>, json: bool) -> Result<()> {
+    let (_, courses) = prepare(semester).await?;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&courses)?);
@@ -868,16 +864,20 @@ async fn cmd_courses(json: bool) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_homework_show(xszyid: String, download: Option<PathBuf>, json: bool) -> Result<()> {
-    let client = login_only().await?;
-    let courses = courses_with_prev(&client).await?;
+async fn cmd_homework_show(
+    semester: Option<&str>,
+    xszyid: String,
+    download: Option<PathBuf>,
+    json: bool,
+) -> Result<()> {
+    let (client, courses) = prepare(semester).await?;
     let hws = client.homework_list(&courses).await?;
     let hw = resolve_item_by_id(
         &hws,
         &xszyid,
         |h| h.student_homework_id.as_str(),
         "Homework",
-        "run `thu-learn hw -a` to list IDs",
+        "run `thu-learn hw -a` to list IDs, and add --semester for another semester",
     )?;
 
     // Fetch details and attachments concurrently.
@@ -903,7 +903,7 @@ async fn cmd_homework_show(xszyid: String, download: Option<PathBuf>, json: bool
     }
 
     let course = if hw.course_name.is_empty() {
-        "(previous course)"
+        "(unknown course)"
     } else {
         &hw.course_name
     };
@@ -988,8 +988,12 @@ async fn download_attachments(
     println!("Downloaded {n} attachments");
 }
 
-async fn cmd_announcement(course_filter: Option<String>, json: bool) -> Result<()> {
-    let (client, courses) = prepare().await?;
+async fn cmd_announcement(
+    semester: Option<&str>,
+    course_filter: Option<String>,
+    json: bool,
+) -> Result<()> {
+    let (client, courses) = prepare(semester).await?;
     let target_courses = filter_courses(&courses, course_filter.as_deref())?
         .into_iter()
         .cloned()
@@ -1008,8 +1012,8 @@ async fn cmd_announcement(course_filter: Option<String>, json: bool) -> Result<(
     Ok(())
 }
 
-async fn cmd_announcement_show(id: String, json: bool) -> Result<()> {
-    let (client, courses) = prepare().await?;
+async fn cmd_announcement_show(semester: Option<&str>, id: String, json: bool) -> Result<()> {
+    let (client, courses) = prepare(semester).await?;
     let notes = client.notification_list(&courses).await?;
     let n = resolve_item_by_id(
         &notes,
@@ -1042,8 +1046,8 @@ async fn cmd_announcement_show(id: String, json: bool) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_file_ls(filter: Option<String>, json: bool) -> Result<()> {
-    let (client, courses) = prepare().await?;
+async fn cmd_file_ls(semester: Option<&str>, filter: Option<String>, json: bool) -> Result<()> {
+    let (client, courses) = prepare(semester).await?;
     let targets = filter_courses(&courses, filter.as_deref())?;
 
     // Fetch each course's files concurrently.
@@ -1088,8 +1092,8 @@ async fn fetch_all_files(client: &Client, courses: &[Course]) -> Vec<crate::mode
         .collect()
 }
 
-async fn cmd_file_show(id: String, json: bool) -> Result<()> {
-    let (client, courses) = prepare().await?;
+async fn cmd_file_show(semester: Option<&str>, id: String, json: bool) -> Result<()> {
+    let (client, courses) = prepare(semester).await?;
     let files = fetch_all_files(&client, &courses).await;
     let f = resolve_item_by_id(
         &files,
@@ -1120,12 +1124,12 @@ async fn cmd_file_show(id: String, json: bool) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_file_get(file_id: String, out: Option<PathBuf>) -> Result<()> {
+async fn cmd_file_get(semester: Option<&str>, file_id: String, out: Option<PathBuf>) -> Result<()> {
     // Full `wjid` values can be downloaded directly; short IDs need lookup.
     let (client, wjid) = if file_id.contains("_KJ_") || file_id.contains("_ZY_") {
         (login_only().await?, file_id.clone())
     } else {
-        let (client, courses) = prepare().await?;
+        let (client, courses) = prepare(semester).await?;
         let files = fetch_all_files(&client, &courses).await;
         let wjid = resolve_item_by_id(
             &files,
@@ -1161,14 +1165,18 @@ async fn cmd_file_get(file_id: String, out: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_submit(homework_id: String, file: PathBuf, comment: String) -> Result<()> {
+async fn cmd_submit(
+    semester: Option<&str>,
+    homework_id: String,
+    file: PathBuf,
+    comment: String,
+) -> Result<()> {
     if !file.exists() {
         anyhow::bail!("File does not exist: {}", file.display());
     }
-    let client = login_only().await?;
+    let (client, courses) = prepare(semester).await?;
 
     // Resolve short IDs to full `xszyid` values when possible.
-    let courses = courses_with_prev(&client).await?;
     let hws = client.homework_list(&courses).await?;
     let xszyid = match resolve_item_prefix(&hws, &homework_id, |h| h.student_homework_id.as_str()) {
         IdResolution::Found(h) => h.student_homework_id.clone(),
@@ -1189,9 +1197,9 @@ async fn cmd_submit(homework_id: String, file: PathBuf, comment: String) -> Resu
 #[cfg(test)]
 mod tests {
     use super::{
-        detail_section, filter_courses, prev_semester, render_announcement_table,
-        render_course_file_table, render_course_table, render_homework_table, render_table,
-        resolve_item_by_id, Cli, TableCell,
+        detail_section, filter_courses, render_announcement_table, render_course_file_table,
+        render_course_table, render_homework_table, render_table, resolve_item_by_id, Cli,
+        TableCell,
     };
     use crate::models::{short_id, Course, CourseFile, Homework, HomeworkStatus, Notification};
     use chrono::TimeZone;
@@ -1289,19 +1297,31 @@ mod tests {
     }
 
     #[test]
-    fn prev_semester_spring_to_fall() {
-        assert_eq!(prev_semester("2025-2026-2").as_deref(), Some("2025-2026-1"));
+    fn semester_arg_accepts_ids_for_every_command() {
+        use clap::Parser;
+
+        let cli = Cli::try_parse_from(["thu-learn", "hw", "-a", "--semester", "2025-2026-1"])
+            .expect("a semester ID parses after the subcommand");
+        assert_eq!(cli.semester.as_deref(), Some("2025-2026-1"));
+        let cli = Cli::try_parse_from(["thu-learn", "--semester", "2024-2025-3", "f", "ls"])
+            .expect("and before it");
+        assert_eq!(cli.semester.as_deref(), Some("2024-2025-3"));
+        assert!(Cli::try_parse_from(["thu-learn", "courses"])
+            .unwrap()
+            .semester
+            .is_none());
     }
 
     #[test]
-    fn prev_semester_fall_to_prev_year() {
-        assert_eq!(prev_semester("2025-2026-1").as_deref(), Some("2024-2025-2"));
-    }
+    fn semester_arg_rejects_malformed_ids() {
+        use clap::Parser;
 
-    #[test]
-    fn prev_semester_invalid() {
-        assert!(prev_semester("garbage").is_none());
-        assert!(prev_semester("2025-2026").is_none());
+        for bad in ["2025-26-1", "2025-2026", "fall", "2025-2026-10"] {
+            assert!(
+                Cli::try_parse_from(["thu-learn", "hw", "--semester", bad]).is_err(),
+                "{bad} should be rejected"
+            );
+        }
     }
 
     #[test]

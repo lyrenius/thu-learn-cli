@@ -24,7 +24,7 @@ use futures::StreamExt;
 use tokio::sync::mpsc;
 
 use crate::client::{AuthError, Client};
-use crate::models::{Course, CourseFile, Homework, HomeworkAttachment};
+use crate::models::{CourseFile, HomeworkAttachment};
 use crate::paths;
 use app::{App, CourseData, Effect, HomeworkDetail, Msg};
 use input::{claim_unique_path, safe_file_name};
@@ -32,6 +32,8 @@ use input::{claim_unique_path, safe_file_name};
 pub struct Options {
     /// Directory for downloads; can be changed inside the TUI.
     pub download_dir: PathBuf,
+    /// Semester to show first instead of Learn's current one.
+    pub semester: Option<String>,
 }
 
 const TICK: Duration = Duration::from_millis(100);
@@ -107,6 +109,9 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal, options: Options) -
     let (tx, mut rx) = mpsc::unbounded_channel();
     let mut runtime = Runtime { tx, client: None };
     let mut app = App::new(options.download_dir, chrono::Local::now());
+    if let Some(semester) = options.semester {
+        app.courses.semester = semester;
+    }
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -207,8 +212,8 @@ impl Runtime {
                     return;
                 };
                 tokio::spawn(async move {
-                    let result = semester_homework(&client, &courses).await;
-                    send(&tx, Msg::Homework(result.map_err(err_text)));
+                    let result = client.homework_list(&courses).await.map_err(err_text);
+                    send(&tx, Msg::Homework(result));
                 });
             }
             Effect::LoadHomeworkDetail {
@@ -369,8 +374,8 @@ async fn load_all(client: Arc<Client>, tx: Tx, semester: Option<String>) {
 
     let client = &*client;
     let homework = async {
-        let result = semester_homework(client, &current).await;
-        send(&tx, Msg::Homework(result.map_err(err_text)));
+        let result = client.homework_list(&current).await.map_err(err_text);
+        send(&tx, Msg::Homework(result));
     };
     let announcements = async {
         let result = client.notification_list(&current).await.map_err(err_text);
@@ -405,18 +410,6 @@ fn with_semesters<'a>(
     list.sort_by(|a, b| b.cmp(a));
     list.dedup();
     list
-}
-
-/// Homework of the given courses. Learn returns every semester's homework in
-/// one list, so the rest is dropped here.
-async fn semester_homework(client: &Client, courses: &[Course]) -> Result<Vec<Homework>> {
-    let mut list = client.homework_list(courses).await?;
-    retain_courses(&mut list, courses);
-    Ok(list)
-}
-
-fn retain_courses(list: &mut Vec<Homework>, courses: &[Course]) {
-    list.retain(|h| courses.iter().any(|c| c.id == h.course_id));
 }
 
 async fn download_file(client: &Client, file: &CourseFile, dir: &Path) -> Result<PathBuf> {
@@ -691,35 +684,5 @@ mod tests {
             super::with_semesters(Vec::new(), [&current, &String::new()]),
             ["2026-2027-1"]
         );
-    }
-
-    #[test]
-    fn homework_is_limited_to_the_semester_courses() {
-        use crate::models::{Course, Homework, HomeworkStatus};
-
-        let hw = |course_id: &str| Homework {
-            student_homework_id: format!("h-{course_id}"),
-            base_id: String::new(),
-            course_id: course_id.into(),
-            course_name: String::new(),
-            title: String::new(),
-            deadline: None,
-            deadline_raw: String::new(),
-            submit_time: String::new(),
-            grade: None,
-            comment: String::new(),
-            grader: String::new(),
-            grade_time: String::new(),
-            status: HomeworkStatus::Graded,
-        };
-        let courses = [Course {
-            id: "now".into(),
-            name: "Networks".into(),
-            teacher: String::new(),
-        }];
-        let mut list = vec![hw("now"), hw("older")];
-        super::retain_courses(&mut list, &courses);
-        assert_eq!(list.len(), 1);
-        assert_eq!(list[0].course_id, "now");
     }
 }

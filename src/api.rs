@@ -80,7 +80,7 @@ impl Client {
         .await
     }
 
-    /// All homework merged across the three status endpoints.
+    /// Homework of `courses`, merged across the three status endpoints.
     pub async fn homework_list(&self, courses: &[Course]) -> Result<Vec<Homework>> {
         let sources = [
             (
@@ -97,7 +97,9 @@ impl Client {
             ),
         ];
 
-        // Query all three status endpoints concurrently; `aoData=[]` means no course filter.
+        // Query all three status endpoints concurrently. `aoData=[]` means no
+        // course filter, so Learn returns every semester's homework; the rest
+        // is dropped below.
         let futs = sources.iter().map(|(url, status)| async move {
             let form = || reqwest::multipart::Form::new().text("aoData", "[]");
             let v = match self.post_multipart_json(url, form).await {
@@ -147,7 +149,9 @@ impl Client {
                 .collect::<Vec<_>>())
         });
         let nested = futures::future::join_all(futs).await;
-        flatten_results(nested)
+        let mut list = flatten_results(nested)?;
+        keep_courses(&mut list, courses);
+        Ok(list)
     }
 
     /// Homework description. The `id` form field is the base homework ID (`zyid`), and `msg` carries the body.
@@ -414,8 +418,13 @@ fn parse_semester_list(v: &Value) -> Vec<String> {
     list
 }
 
+/// Keeps homework of `courses` only.
+fn keep_courses(list: &mut Vec<Homework>, courses: &[Course]) {
+    list.retain(|h| courses.iter().any(|c| c.id == h.course_id));
+}
+
 /// `YYYY-YYYY-N`, the form Learn uses for semester IDs.
-fn is_semester_id(s: &str) -> bool {
+pub fn is_semester_id(s: &str) -> bool {
     let parts: Vec<&str> = s.split('-').collect();
     matches!(parts.as_slice(), [a, b, t]
         if a.len() == 4 && b.len() == 4 && t.len() == 1
@@ -831,6 +840,34 @@ fn parse_deadline(raw: &str) -> Option<chrono::DateTime<chrono::Local>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn homework_is_limited_to_the_given_courses() {
+        let hw = |course_id: &str| Homework {
+            student_homework_id: format!("h-{course_id}"),
+            base_id: String::new(),
+            course_id: course_id.into(),
+            course_name: String::new(),
+            title: String::new(),
+            deadline: None,
+            deadline_raw: String::new(),
+            submit_time: String::new(),
+            grade: None,
+            comment: String::new(),
+            grader: String::new(),
+            grade_time: String::new(),
+            status: HomeworkStatus::Graded,
+        };
+        let courses = [Course {
+            id: "now".into(),
+            name: "Networks".into(),
+            teacher: String::new(),
+        }];
+        let mut list = vec![hw("now"), hw("older")];
+        keep_courses(&mut list, &courses);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].course_id, "now");
+    }
 
     #[test]
     fn semester_list_skips_nulls_and_sorts_newest_first() {

@@ -21,7 +21,7 @@
 ## Local Checks
 
 * Run from the repo root: `cargo test`, `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, then `cargo build --release`.
-* Focused examples: `cargo test api::tests::parse_deadline_invalid`, `cargo test client::tests::csrf_extracted`, `cargo test cli::tests::prev_semester_invalid`.
+* Focused examples: `cargo test api::tests::parse_deadline_invalid`, `cargo test client::tests::csrf_extracted`, `cargo test cli::tests::semester_arg_rejects_malformed_ids`.
 * There is no CI, task runner, rustfmt config, or clippy config in this repo; trust Cargo commands and source tests over assumptions.
 
 ## Runtime And Data Safety
@@ -39,7 +39,7 @@
 * Explain pinyin API fields near parsing/model code with both Chinese and English names, for example `xszyid`: 学生作业 ID / student homework ID.
 * Session cookies are nonpersistent. `src/client.rs` intentionally saves with `save_incl_expired_and_nonpersistent_json` and loads with `load_json_all`; replacing these with ordinary cookie-store save/load breaks login reuse.
 * Authenticated GET, POST, and download requests need `_csrf` from the course page before calling Learn endpoints.
-* The homework list endpoints with `aoData=[]` return every semester's homework at once; the TUI keeps only the shown semester's courses. `queryxnxq` lists the semesters (thu-learn-lib's `getSemesterIdList`) and can contain `null`; `loadCourseBySemesterId` works for any of them.
+* The homework list endpoints with `aoData=[]` return every semester's homework at once; `homework_list` keeps only the courses it is given, so the CLI (`--semester`, default current) and the TUI show one semester. `queryxnxq` lists the semesters (thu-learn-lib's `getSemesterIdList`) and can contain `null`; `loadCourseBySemesterId` works for any of them.
 * Silent re-login follows thu-learn-lib (robertying fork): clear the ID `JSESSIONID`, read `#sm2publicKey` from the login form, POST `i_user`, `i_pass` = `04` + SM2 C1C3C2 hex, `singleLogin=on`, `fingerPrint`, `fingerGenPrint`, `fingerGenPrint3`, `i_captcha` to `/do/off/ui/auth/login/check`, then GET `/b/j_spring_security_thauth_roaming_entry?ticket=...`. Learn reports an expired session by redirecting to `login_timeout` or answering 403.
 * `Client` performs at most one re-login per expired session generation. A transient failure is shared by all requests for 30 s, then retried. A definitive rejection (`SsoFailure::Rejected`, `NeedsTwoFactor`, `NoTicket`) is never retried for the same credentials: it is cached in memory and, for rejected passwords and untrusted devices, written as a credential hash to `relogin-blocked.json` next to `cookies.json`, so later processes do not retry it either (repeated failures can trigger a captcha). A successful login or logout clears the marker. POST bodies are passed as `Fn() -> Form` because a retry needs a fresh multipart form.
 * By default `Client` re-reads the credential store on each renewal, so `login`/`logout` in another process take effect; `set_credentials` pins credentials (tests, login verification), `use_saved_credentials` returns to the store, and `logout` disables renewal. Logins are bounded by connect/read timeouts and a 60 s overall timeout, and auth-path errors drop request URLs (they can carry the ticket or `_csrf`).

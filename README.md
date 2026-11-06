@@ -159,11 +159,15 @@ thu-learn submit <id> ./hw.pdf -c "submission note"
 
 # JSON output
 thu-learn hw --json
+
+# Another semester (1 = fall, 2 = spring, 3 = summer); works with every command
+thu-learn hw -a --semester 2025-2026-1
 ```
 
 Notes:
 
 * Human output uses color when stdout supports it; `--json` output is plain structured data.
+* Commands use Learn's current semester unless `--semester` names another; `thu-learn --semester <ID>` opens the TUI on that semester.
 * The current semester and course list are cached for six hours.
 * Homework, announcement, and file requests are intentionally concurrent.
 * Expired sessions are renewed automatically when credentials are saved. If automatic re-login fails, or after `login --no-remember`, commands ask you to run `thu-learn login` again.
@@ -184,7 +188,7 @@ Focused examples:
 ```bash
 cargo test api::tests::parse_deadline_invalid
 cargo test client::tests::csrf_extracted
-cargo test cli::tests::prev_semester_invalid
+cargo test cli::tests::semester_arg_rejects_malformed_ids
 cargo test client::tests::expired_session_is_renewed_once_for_concurrent_requests
 cargo test sso::tests::sm_crypto_fixture_decrypts_with_c1c3c2_layout
 ```
