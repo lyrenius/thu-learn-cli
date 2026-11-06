@@ -34,7 +34,7 @@ thu-learn            # in a terminal; same as `thu-learn tui`
 thu-learn tui -d ~/Downloads
 ```
 
-The screen shows a list on the left and details for the selected item on the right (stacked on narrow terminals). The TUI reuses the session saved by `thu-learn login` and, like the CLI, renews it automatically when it expires. If there is no usable session (or automatic re-login fails), it asks you to run `thu-learn login` and press `r`.
+The screen shows a list on the left and details for the selected item on the right (stacked on narrow terminals). Every tab shows one semester, starting with Learn's current one; an earlier semester's ID turns yellow in the header while you view it. The TUI reuses the session saved by `thu-learn login` and, like the CLI, renews it automatically when it expires. If there is no usable session (or automatic re-login fails), it asks you to run `thu-learn login` and press `r`.
 
 | Key | Action |
 | --- | --- |
@@ -44,6 +44,7 @@ The screen shows a list on the left and details for the selected item on the rig
 | `J`/`K` | Scroll details; `n`/`p` move to the next/previous item while details are open |
 | `/` | Search the current list; `Esc` clears the search, then the file selection, then the course filter |
 | `c` | Choose a course for every tab |
+| `S` | Switch semester (or click the semester in the top-right corner) |
 | `f` | Homework: cycle pending, overdue, done, all. Announcements: toggle unread only |
 | `Space`, `v`/`V`, `C-a`/`C-r` | Files: select like yazi. Toggle and move down, visual select/unselect (move to extend the range, `Esc` applies it), select all, invert |
 | `d` | Download the highlighted homework's attachments or the highlighted file; with files selected, every selected file |

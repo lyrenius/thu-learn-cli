@@ -172,13 +172,28 @@ pub enum DetailState {
     Failed(String),
 }
 
+/// The semester shown and its courses. Every tab shows one semester at a time.
 #[derive(Debug, Clone, Default)]
 pub struct CourseData {
+    /// Semester ID, such as `2026-2027-1`.
     pub semester: String,
-    /// Current-semester courses, shown in the Courses tab and course picker.
-    pub current: Vec<Course>,
-    /// Previous-semester courses, used to name older homework.
-    pub previous: Vec<Course>,
+    /// Learn's current semester, shown first.
+    pub current_semester: String,
+    /// Semesters to switch to, newest first.
+    pub semesters: Vec<String>,
+    /// Courses of the shown semester.
+    pub list: Vec<Course>,
+}
+
+/// `2025-2026-1` as `Fall 2025`: Learn numbers fall 1, spring 2, and summer 3.
+pub fn semester_label(id: &str) -> String {
+    let parts: Vec<&str> = id.split('-').collect();
+    match parts.as_slice() {
+        [y1, _, "1"] => format!("Fall {y1}"),
+        [_, y2, "2"] => format!("Spring {y2}"),
+        [_, y2, "3"] => format!("Summer {y2}"),
+        _ => id.to_string(),
+    }
 }
 
 /// yazi's visual mode in the Files tab: the files between `anchor` and the
@@ -201,9 +216,11 @@ pub struct Hits {
     pub list: Rect,
     pub rows: Rect,
     pub detail: Rect,
-    /// Course picker rows and the index of the first one shown.
-    pub courses: Rect,
-    pub courses_offset: usize,
+    /// The semester in the header.
+    pub semester: Rect,
+    /// Course or semester picker rows and the index of the first one shown.
+    pub menu: Rect,
+    pub menu_offset: usize,
     /// The confirmation's `[Y]es` and `(N)o` buttons.
     pub yes: Rect,
     pub no: Rect,
@@ -217,8 +234,11 @@ pub struct Hits {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Effect {
     CheckSession,
-    /// Reload courses, homework, announcements, and files.
-    LoadAll,
+    /// Load a semester's courses, homework, announcements, and files;
+    /// `None` is Learn's current semester.
+    LoadAll {
+        semester: Option<String>,
+    },
     LoadHomework {
         courses: Vec<Course>,
     },
@@ -309,8 +329,12 @@ pub struct SubmitState {
 #[derive(Debug, Clone)]
 pub enum Overlay {
     Help,
-    /// Index 0 is "All courses"; index `n` is `courses.current[n - 1]`.
+    /// Index 0 is "All courses"; index `n` is `courses.list[n - 1]`.
     CoursePicker {
+        selected: usize,
+    },
+    /// Index into `courses.semesters`.
+    SemesterPicker {
         selected: usize,
     },
     Submit(Box<SubmitState>),
@@ -455,9 +479,8 @@ impl App {
 
     pub fn course_name(&self, id: &str) -> Option<&str> {
         self.courses
-            .current
+            .list
             .iter()
-            .chain(&self.courses.previous)
             .find(|c| c.id == id)
             .map(|c| c.name.as_str())
     }
@@ -513,7 +536,7 @@ impl App {
     pub fn visible_courses(&self) -> Vec<&Course> {
         let q = self.query(Tab::Courses);
         self.courses
-            .current
+            .list
             .iter()
             .filter(|c| matches_query(&q, &[&c.name, &c.teacher]))
             .collect()
@@ -579,7 +602,7 @@ impl App {
 
     pub fn selected_course(&self) -> Option<&Course> {
         let key = self.selected_key(Tab::Courses)?;
-        self.courses.current.iter().find(|c| c.id == key)
+        self.courses.list.iter().find(|c| c.id == key)
     }
 
     pub fn pending_count(&self, course_id: Option<&str>) -> usize {
@@ -688,7 +711,7 @@ impl App {
                         let keep_filter = self
                             .course_filter
                             .as_ref()
-                            .is_some_and(|id| data.current.iter().any(|c| &c.id == id));
+                            .is_some_and(|id| data.list.iter().any(|c| &c.id == id));
                         if !keep_filter {
                             self.course_filter = None;
                         }
@@ -750,7 +773,7 @@ impl App {
                         if self.session == Session::Ready {
                             self.homework.start();
                             return vec![Effect::LoadHomework {
-                                courses: self.all_courses(),
+                                courses: self.courses.list.clone(),
                             }];
                         }
                     }
@@ -794,21 +817,61 @@ impl App {
         self.last_download = Some(target);
     }
 
-    fn all_courses(&self) -> Vec<Course> {
-        self.courses
-            .current
-            .iter()
-            .chain(&self.courses.previous)
-            .cloned()
-            .collect()
-    }
-
+    /// Reloads the shown semester, or Learn's current one before any has loaded.
     fn reload_all(&mut self) -> Vec<Effect> {
         self.courses_loading = true;
         self.homework.start();
         self.announcements.start();
         self.files.start();
-        vec![Effect::LoadAll]
+        let semester = Some(self.courses.semester.clone()).filter(|s| !s.is_empty());
+        vec![Effect::LoadAll { semester }]
+    }
+
+    fn lists_loading(&self) -> bool {
+        self.courses_loading
+            || self.homework.loading
+            || self.announcements.loading
+            || self.files.loading
+    }
+
+    fn open_semester_picker(&mut self) {
+        if self.lists_loading() {
+            self.info("Still loading; switch semesters once it finishes.");
+            return;
+        }
+        let shown = &self.courses.semester;
+        let selected = self
+            .courses
+            .semesters
+            .iter()
+            .position(|s| s == shown)
+            .unwrap_or(0);
+        self.overlay = Some(Overlay::SemesterPicker { selected });
+    }
+
+    /// Shows another semester. Its lists start empty rather than showing the
+    /// old semester's items under the new name.
+    fn switch_semester(&mut self, semester: String) -> Vec<Effect> {
+        if semester == self.courses.semester {
+            return Vec::new();
+        }
+        self.apply_visual();
+        self.info(format!(
+            "Showing {semester} ({})",
+            semester_label(&semester)
+        ));
+        self.courses.semester = semester;
+        self.courses.list.clear();
+        self.homework = Remote::default();
+        self.announcements = Remote::default();
+        self.files = Remote::default();
+        self.details.clear();
+        self.selected_files.clear();
+        self.course_filter = None;
+        self.selection = Default::default();
+        self.offsets = [0; 4];
+        self.zoomed = false;
+        self.reload_all()
     }
 
     // ---------- Timer ----------
@@ -1081,7 +1144,7 @@ impl App {
                 let selected = self
                     .course_filter
                     .as_ref()
-                    .and_then(|id| self.courses.current.iter().position(|c| &c.id == id))
+                    .and_then(|id| self.courses.list.iter().position(|c| &c.id == id))
                     .map_or(0, |i| i + 1);
                 self.overlay = Some(Overlay::CoursePicker { selected });
             }
@@ -1100,6 +1163,10 @@ impl App {
                 }
                 _ => {}
             },
+            KeyCode::Char('S') => {
+                self.apply_visual();
+                self.open_semester_picker();
+            }
             KeyCode::Char('r') => {
                 if self.courses_loading || self.homework.loading {
                     self.info("Already refreshing…");
@@ -1259,7 +1326,7 @@ impl App {
             return;
         };
         let course = if hw.course_name.is_empty() {
-            "(previous course)".to_string()
+            "(unknown course)".to_string()
         } else {
             hw.course_name.clone()
         };
@@ -1283,7 +1350,7 @@ impl App {
                 }
             }
             Overlay::CoursePicker { mut selected } => {
-                let count = self.courses.current.len() + 1;
+                let count = self.courses.list.len() + 1;
                 match key.code {
                     KeyCode::Esc | KeyCode::Char('q' | 'c') => return Vec::new(),
                     KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1) % count,
@@ -1293,7 +1360,7 @@ impl App {
                     KeyCode::Enter => {
                         self.course_filter = selected
                             .checked_sub(1)
-                            .and_then(|i| self.courses.current.get(i))
+                            .and_then(|i| self.courses.list.get(i))
                             .map(|c| c.id.clone());
                         self.offsets = [0; 4];
                         self.selection_changed_at = Instant::now();
@@ -1305,6 +1372,24 @@ impl App {
                     _ => {}
                 }
                 self.overlay = Some(Overlay::CoursePicker { selected });
+            }
+            Overlay::SemesterPicker { mut selected } => {
+                let count = self.courses.semesters.len().max(1);
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q' | 'S') => return Vec::new(),
+                    KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1) % count,
+                    KeyCode::Up | KeyCode::Char('k') => selected = (selected + count - 1) % count,
+                    KeyCode::Home | KeyCode::Char('g') => selected = 0,
+                    KeyCode::End | KeyCode::Char('G') => selected = count - 1,
+                    KeyCode::Enter => {
+                        return match self.courses.semesters.get(selected).cloned() {
+                            Some(semester) => self.switch_semester(semester),
+                            None => Vec::new(),
+                        };
+                    }
+                    _ => {}
+                }
+                self.overlay = Some(Overlay::SemesterPicker { selected });
             }
             Overlay::Submit(mut submit) => {
                 let outcome = submit.picker.on_key(key);
@@ -1430,6 +1515,10 @@ impl App {
                 if let Some(&(_, tab)) = tab {
                     self.searching = false;
                     self.switch_tab(tab);
+                } else if self.hits.semester.contains(pos) {
+                    self.searching = false;
+                    self.apply_visual();
+                    self.open_semester_picker();
                 } else if let Some(row) = self.row_at(pos) {
                     self.searching = false;
                     let current = self.selected_index(self.tab).unwrap_or(0);
@@ -1467,19 +1556,21 @@ impl App {
                 let outcome = submit.picker.on_mouse(event);
                 self.on_picker_outcome(submit, outcome)
             }
-            Overlay::CoursePicker { selected } => {
-                let row =
-                    self.hits.courses_offset + pos.y.saturating_sub(self.hits.courses.y) as usize;
-                let overlay = Overlay::CoursePicker { selected };
+            overlay @ (Overlay::CoursePicker { .. } | Overlay::SemesterPicker { .. }) => {
+                let (count, pick): (usize, fn(usize) -> Overlay) = match overlay {
+                    Overlay::CoursePicker { .. } => (self.courses.list.len() + 1, |selected| {
+                        Overlay::CoursePicker { selected }
+                    }),
+                    _ => (self.courses.semesters.len(), |selected| {
+                        Overlay::SemesterPicker { selected }
+                    }),
+                };
+                let row = self.hits.menu_offset + pos.y.saturating_sub(self.hits.menu.y) as usize;
                 match event.kind {
                     MouseEventKind::ScrollDown => self.on_overlay_key(overlay, key(KeyCode::Down)),
                     MouseEventKind::ScrollUp => self.on_overlay_key(overlay, key(KeyCode::Up)),
-                    _ if left
-                        && self.hits.courses.contains(pos)
-                        && row <= self.courses.current.len() =>
-                    {
-                        let overlay = Overlay::CoursePicker { selected: row };
-                        self.on_overlay_key(overlay, key(KeyCode::Enter))
+                    _ if left && self.hits.menu.contains(pos) && row < count => {
+                        self.on_overlay_key(pick(row), key(KeyCode::Enter))
                     }
                     _ => {
                         self.overlay = Some(overlay);
@@ -1653,8 +1744,9 @@ pub(crate) mod tests {
         app.session = Session::Ready;
         app.courses = CourseData {
             semester: "2025-2026-2".into(),
-            current: vec![course("c1", "Data Structures"), course("c2", "Networks")],
-            previous: vec![],
+            current_semester: "2025-2026-2".into(),
+            semesters: vec!["2025-2026-2".into(), "2025-2026-1".into()],
+            list: vec![course("c1", "Data Structures"), course("c2", "Networks")],
         };
         app.homework.finish(Ok(vec![
             homework(
@@ -2093,6 +2185,64 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn semester_labels_name_the_term() {
+        assert_eq!(semester_label("2025-2026-1"), "Fall 2025");
+        assert_eq!(semester_label("2025-2026-2"), "Spring 2026");
+        assert_eq!(semester_label("2025-2026-3"), "Summer 2026");
+        assert_eq!(semester_label("odd"), "odd");
+    }
+
+    #[test]
+    fn switching_semesters_reloads_an_empty_view() {
+        let mut app = files_app();
+        app.course_filter = Some("c2".into());
+        ctrl(&mut app, 'a');
+        // Not while lists are still loading.
+        app.files.loading = true;
+        press(&mut app, KeyCode::Char('S'));
+        assert!(app.overlay.is_none());
+        app.files.loading = false;
+
+        press(&mut app, KeyCode::Char('S'));
+        assert!(matches!(
+            app.overlay,
+            Some(Overlay::SemesterPicker { selected: 0 })
+        ));
+        press(&mut app, KeyCode::Char('j'));
+        let effects = press(&mut app, KeyCode::Enter);
+        let older = Some("2025-2026-1".to_string());
+        assert_eq!(
+            effects,
+            vec![Effect::LoadAll {
+                semester: older.clone()
+            }]
+        );
+        assert_eq!(app.courses.semester, "2025-2026-1");
+        assert!(app.courses.list.is_empty());
+        assert!(app.homework.data.is_empty() && app.files.data.is_empty());
+        assert!(app.courses_loading && app.homework.loading && !app.homework.loaded);
+        assert!(app.course_filter.is_none() && app.selected_files.is_empty());
+
+        // Once loaded, a refresh stays on the chosen semester.
+        app.on_msg(Msg::Courses(Ok(CourseData {
+            semester: "2025-2026-1".into(),
+            current_semester: "2025-2026-2".into(),
+            semesters: vec!["2025-2026-2".into(), "2025-2026-1".into()],
+            list: vec![course("c9", "Old course")],
+        })));
+        app.on_msg(Msg::Homework(Ok(Vec::new())));
+        app.on_msg(Msg::Announcements(Ok(Vec::new())));
+        app.on_msg(Msg::Files {
+            files: Vec::new(),
+            failures: Vec::new(),
+        });
+        assert_eq!(
+            press(&mut app, KeyCode::Char('r')),
+            vec![Effect::LoadAll { semester: older }]
+        );
+    }
+
+    #[test]
     fn refresh_drops_missing_selections() {
         let mut app = files_app();
         ctrl(&mut app, 'a');
@@ -2210,7 +2360,10 @@ pub(crate) mod tests {
             vec![Effect::CheckSession]
         );
         assert_eq!(app.session, Session::Checking);
-        assert_eq!(app.on_msg(Msg::SessionReady), vec![Effect::LoadAll]);
+        assert_eq!(
+            app.on_msg(Msg::SessionReady),
+            vec![Effect::LoadAll { semester: None }]
+        );
         assert_eq!(app.session, Session::Ready);
     }
 

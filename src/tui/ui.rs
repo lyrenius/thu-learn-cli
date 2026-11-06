@@ -14,8 +14,8 @@ use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::app::{
-    is_overdue, AnnouncementFilter, App, DetailState, Hits, HomeworkFilter, Overlay, Session,
-    StatusKind, SubmitState, Tab,
+    is_overdue, semester_label, AnnouncementFilter, App, DetailState, Hits, HomeworkFilter,
+    Overlay, Session, StatusKind, SubmitState, Tab,
 };
 use super::picker::view as picker_view;
 use crate::cli::strip_terminal_controls;
@@ -94,7 +94,7 @@ fn fit(s: &str, width: usize) -> String {
 
 fn course_label(name: &str) -> String {
     if name.is_empty() {
-        "(previous course)".to_string()
+        "(unknown course)".to_string()
     } else {
         clean(name)
     }
@@ -206,6 +206,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     match &mut overlay {
         Some(Overlay::Help) => draw_help(f, app),
         Some(Overlay::CoursePicker { selected }) => draw_course_picker(f, app, *selected),
+        Some(Overlay::SemesterPicker { selected }) => draw_semester_picker(f, app, *selected),
         Some(Overlay::Submit(submit)) => draw_submit(f, submit),
         Some(Overlay::Confirm {
             title, lines, back, ..
@@ -232,7 +233,8 @@ fn draw_header(f: &mut Frame, app: &mut App, area: Rect) {
     } else {
         " "
     };
-    let right = match app.courses.semester.as_str() {
+    let semester = app.courses.semester.clone();
+    let right = match semester.as_str() {
         "" => format!("{spinner} "),
         sem => format!("{sem} {spinner} "),
     };
@@ -287,7 +289,25 @@ fn draw_header(f: &mut Frame, app: &mut App, area: Rect) {
         .divider(Span::styled("│", muted()))
         .padding(" ", " ");
     f.render_widget(tabs, tabs_area);
-    f.render_widget(Paragraph::new(Span::styled(right, muted())), right_area);
+    // A past semester stands out; clicking the semester switches it.
+    let past = !semester.is_empty() && semester != app.courses.current_semester;
+    let semester_style = if past {
+        Style::new().fg(Color::Yellow).bold()
+    } else {
+        muted()
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(semester.clone(), semester_style),
+            Span::styled(right[semester.len()..].to_string(), muted()),
+        ])),
+        right_area,
+    );
+    if ready && !semester.is_empty() {
+        let width = UnicodeWidthStr::width(semester.as_str()) as u16;
+        app.hits.semester =
+            Rect::new(right_area.x, right_area.y, width, 1).intersection(right_area);
+    }
 }
 
 fn draw_status(f: &mut Frame, app: &App, area: Rect) {
@@ -340,6 +360,9 @@ fn draw_keys(f: &mut Frame, app: &mut App, area: Rect) {
             Overlay::Help => vec![("Esc", "close")],
             Overlay::CoursePicker { .. } => {
                 vec![("↑↓", "choose"), ("⏎", "apply"), ("Esc", "cancel")]
+            }
+            Overlay::SemesterPicker { .. } => {
+                vec![("↑↓", "choose"), ("⏎", "switch"), ("Esc", "cancel")]
             }
             // The picker draws its own header and status bar over everything.
             Overlay::Submit(_) => Vec::new(),
@@ -1385,6 +1408,7 @@ const HELP: [(&str, &[(&str, &str)]); 5] = [
         &[
             ("/", "search the current list"),
             ("c", "choose a course"),
+            ("S", "switch semester"),
             ("f", "cycle status / toggle unread"),
             ("Esc", "clear search, then course"),
         ],
@@ -1469,7 +1493,7 @@ fn draw_help(f: &mut Frame, app: &App) {
 
 fn draw_course_picker(f: &mut Frame, app: &mut App, selected: usize) {
     let mut items = vec![ListItem::new(Line::from(vec![Span::raw("All courses")]))];
-    for c in &app.courses.current {
+    for c in &app.courses.list {
         let pending = app.pending_count(Some(&c.id));
         let mut spans = vec![Span::raw(clean(&c.name))];
         if pending > 0 {
@@ -1491,14 +1515,47 @@ fn draw_course_picker(f: &mut Frame, app: &mut App, selected: usize) {
         .min(f.area().height.saturating_sub(4))
         .max(5);
     let (area, b) = popup(f, 60, height, "Course");
-    app.hits.courses = b.inner(area);
+    app.hits.menu = b.inner(area);
     let list = List::new(items)
         .block(b)
         .highlight_style(Style::new().bg(Color::DarkGray).fg(Color::White).bold())
         .highlight_symbol("▌ ");
     let mut state = ListState::default().with_selected(Some(selected));
     f.render_stateful_widget(list, area, &mut state);
-    app.hits.courses_offset = state.offset();
+    app.hits.menu_offset = state.offset();
+}
+
+fn draw_semester_picker(f: &mut Frame, app: &mut App, selected: usize) {
+    let items: Vec<ListItem> = app
+        .courses
+        .semesters
+        .iter()
+        .map(|s| {
+            let mut spans = vec![
+                Span::raw(s.clone()),
+                Span::styled(format!("  {}", semester_label(s)), muted()),
+            ];
+            if *s == app.courses.current_semester {
+                spans.push(Span::styled("  current", Style::new().fg(ACCENT)));
+            }
+            if *s == app.courses.semester {
+                spans.push(Span::styled("  showing", Style::new().fg(Color::Yellow)));
+            }
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+    let height = (items.len() as u16 + 2)
+        .min(f.area().height.saturating_sub(4))
+        .max(5);
+    let (area, b) = popup(f, 48, height, "Semester");
+    app.hits.menu = b.inner(area);
+    let list = List::new(items)
+        .block(b)
+        .highlight_style(Style::new().bg(Color::DarkGray).fg(Color::White).bold())
+        .highlight_symbol("▌ ");
+    let mut state = ListState::default().with_selected(Some(selected));
+    f.render_stateful_widget(list, area, &mut state);
+    app.hits.menu_offset = state.offset();
 }
 
 fn input_line(f: &mut Frame, area: Rect, label: &str, input: &super::input::Input, active: bool) {
@@ -2009,5 +2066,39 @@ mod tests {
         let screen = render(&mut app, 120, 20);
         assert!(row(&screen).contains("2026-06-02 08:00"), "{screen}");
         assert!(screen.contains("2027-01-03 23:59"), "{screen}");
+    }
+
+    #[test]
+    fn semester_switches_from_the_header_and_past_ones_stand_out() {
+        let mut app = ready_app();
+        let screen = render(&mut app, 120, 20);
+        let at = find(&screen, "2025-2026-2");
+        let style = |app: &mut App| {
+            let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+            terminal.draw(|f| draw(f, app)).unwrap();
+            terminal.backend().buffer()[at].fg
+        };
+        assert_eq!(style(&mut app), MUTED);
+
+        app.on_mouse(click(at));
+        assert!(matches!(app.overlay, Some(Overlay::SemesterPicker { .. })));
+        let screen = render(&mut app, 120, 20);
+        assert!(
+            screen.contains("2025-2026-2  Spring 2026  current  showing"),
+            "{screen}"
+        );
+        assert!(screen.contains("2025-2026-1  Fall 2025"), "{screen}");
+        let effects = app.on_mouse(click(find(&screen, "2025-2026-1")));
+        assert_eq!(
+            effects,
+            vec![Effect::LoadAll {
+                semester: Some("2025-2026-1".into())
+            }]
+        );
+        let screen = render(&mut app, 120, 20);
+        let at = find(&screen, "2025-2026-1");
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        assert_eq!(terminal.backend().buffer()[at].fg, Color::Yellow);
     }
 }

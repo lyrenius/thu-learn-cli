@@ -24,7 +24,7 @@ use futures::StreamExt;
 use tokio::sync::mpsc;
 
 use crate::client::{AuthError, Client};
-use crate::models::{Course, CourseFile, HomeworkAttachment};
+use crate::models::{Course, CourseFile, Homework, HomeworkAttachment};
 use crate::paths;
 use app::{App, CourseData, Effect, HomeworkDetail, Msg};
 use input::{claim_unique_path, safe_file_name};
@@ -196,19 +196,19 @@ impl Runtime {
                     }
                 });
             }
-            Effect::LoadAll => {
+            Effect::LoadAll { semester } => {
                 let Some(client) = self.client(|e| Msg::Courses(Err(e))) else {
                     return;
                 };
-                tokio::spawn(load_all(client, tx));
+                tokio::spawn(load_all(client, tx, semester));
             }
             Effect::LoadHomework { courses } => {
                 let Some(client) = self.client(|e| Msg::Homework(Err(e))) else {
                     return;
                 };
                 tokio::spawn(async move {
-                    let result = client.homework_list(&courses).await.map_err(err_text);
-                    send(&tx, Msg::Homework(result));
+                    let result = semester_homework(&client, &courses).await;
+                    send(&tx, Msg::Homework(result.map_err(err_text)));
                 });
             }
             Effect::LoadHomeworkDetail {
@@ -337,20 +337,23 @@ fn session_failure(e: &anyhow::Error) -> String {
     }
 }
 
-/// Loads courses first, then homework, announcements, and files concurrently.
-/// Each list is reported as soon as it arrives.
-async fn load_all(client: Arc<Client>, tx: Tx) {
+/// Loads a semester's courses (Learn's current semester when `semester` is
+/// `None`), then its homework, announcements, and files concurrently. Each
+/// list is reported as soon as it arrives.
+async fn load_all(client: Arc<Client>, tx: Tx, semester: Option<String>) {
     let courses = async {
-        let semester = client.current_semester().await?;
-        let current = client.course_list(&semester).await?;
-        let previous = match crate::cli::prev_semester(&semester) {
-            Some(prev) => client.course_list(&prev).await.unwrap_or_default(),
-            None => Vec::new(),
-        };
+        let current_semester = client.current_semester().await?;
+        let semester = semester.unwrap_or_else(|| current_semester.clone());
+        let (list, semesters) = tokio::join!(client.course_list(&semester), client.semester_list());
         anyhow::Ok(CourseData {
+            // Switching needs the semester list, but showing one does not.
+            semesters: with_semesters(
+                semesters.unwrap_or_default(),
+                [&current_semester, &semester],
+            ),
             semester,
-            current,
-            previous,
+            current_semester,
+            list: list?,
         })
     }
     .await;
@@ -361,14 +364,13 @@ async fn load_all(client: Arc<Client>, tx: Tx) {
             return;
         }
     };
-    let all: Vec<Course> = data.current.iter().chain(&data.previous).cloned().collect();
-    let current = data.current.clone();
+    let current = data.list.clone();
     send(&tx, Msg::Courses(Ok(data)));
 
     let client = &*client;
     let homework = async {
-        let result = client.homework_list(&all).await.map_err(err_text);
-        send(&tx, Msg::Homework(result));
+        let result = semester_homework(client, &current).await;
+        send(&tx, Msg::Homework(result.map_err(err_text)));
     };
     let announcements = async {
         let result = client.notification_list(&current).await.map_err(err_text);
@@ -392,6 +394,29 @@ async fn load_all(client: Arc<Client>, tx: Tx) {
         send(&tx, Msg::Files { files, failures });
     };
     tokio::join!(homework, announcements, files);
+}
+
+/// Adds semesters to a newest-first list, keeping it sorted and unique.
+fn with_semesters<'a>(
+    mut list: Vec<String>,
+    add: impl IntoIterator<Item = &'a String>,
+) -> Vec<String> {
+    list.extend(add.into_iter().filter(|s| !s.is_empty()).cloned());
+    list.sort_by(|a, b| b.cmp(a));
+    list.dedup();
+    list
+}
+
+/// Homework of the given courses. Learn returns every semester's homework in
+/// one list, so the rest is dropped here.
+async fn semester_homework(client: &Client, courses: &[Course]) -> Result<Vec<Homework>> {
+    let mut list = client.homework_list(courses).await?;
+    retain_courses(&mut list, courses);
+    Ok(list)
+}
+
+fn retain_courses(list: &mut Vec<Homework>, courses: &[Course]) {
+    list.retain(|h| courses.iter().any(|c| c.id == h.course_id));
 }
 
 async fn download_file(client: &Client, file: &CourseFile, dir: &Path) -> Result<PathBuf> {
@@ -650,5 +675,51 @@ mod tests {
         };
         assert_eq!(saved, vec![PathBuf::from("/d/a.pdf")]);
         assert_eq!(failed, vec!["b.pdf: HTTP 404".to_string()]);
+    }
+
+    #[test]
+    fn semester_lists_stay_sorted_and_unique() {
+        let list = vec!["2025-2026-2".to_string(), "2024-2025-1".to_string()];
+        let current = "2026-2027-1".to_string();
+        let shown = "2025-2026-2".to_string();
+        assert_eq!(
+            super::with_semesters(list, [&current, &shown]),
+            ["2026-2027-1", "2025-2026-2", "2024-2025-1"]
+        );
+        // Without the list, the current and shown semesters remain.
+        assert_eq!(
+            super::with_semesters(Vec::new(), [&current, &String::new()]),
+            ["2026-2027-1"]
+        );
+    }
+
+    #[test]
+    fn homework_is_limited_to_the_semester_courses() {
+        use crate::models::{Course, Homework, HomeworkStatus};
+
+        let hw = |course_id: &str| Homework {
+            student_homework_id: format!("h-{course_id}"),
+            base_id: String::new(),
+            course_id: course_id.into(),
+            course_name: String::new(),
+            title: String::new(),
+            deadline: None,
+            deadline_raw: String::new(),
+            submit_time: String::new(),
+            grade: None,
+            comment: String::new(),
+            grader: String::new(),
+            grade_time: String::new(),
+            status: HomeworkStatus::Graded,
+        };
+        let courses = [Course {
+            id: "now".into(),
+            name: "Networks".into(),
+            teacher: String::new(),
+        }];
+        let mut list = vec![hw("now"), hw("older")];
+        super::retain_courses(&mut list, &courses);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].course_id, "now");
     }
 }

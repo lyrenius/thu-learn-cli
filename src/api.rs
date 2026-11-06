@@ -31,6 +31,25 @@ impl Client {
         .await
     }
 
+    /// Semester IDs the student can browse, newest first, cached for six hours.
+    /// This is the list thu-learn-lib's `getSemesterIdList` and learnX use.
+    pub async fn semester_list(&self) -> Result<Vec<String>> {
+        crate::cache::with_cache(
+            "semesters",
+            std::time::Duration::from_secs(6 * 3600),
+            async {
+                let url = format!("{LEARN}/b/wlxt/kc/v_wlkc_xs_xktjb_coassb/queryxnxq");
+                let v = self.get_json(&url).await?;
+                let semesters = parse_semester_list(&v);
+                if semesters.is_empty() {
+                    anyhow::bail!("Could not parse the semester list from response: {v}");
+                }
+                Ok(semesters)
+            },
+        )
+        .await
+    }
+
     /// Courses for one semester, cached for six hours.
     pub async fn course_list(&self, semester: &str) -> Result<Vec<Course>> {
         crate::cache::with_cache(
@@ -377,6 +396,32 @@ fn pick(v: &Value, keys: &[&str]) -> String {
 }
 
 /// Finds the first array under any candidate key, recursing into nested objects.
+/// Semester IDs (`xnxq`: 学年学期 / academic year and term, such as
+/// `2025-2026-1`) from the semester list, newest first. Learn sometimes puts
+/// `null` in the list.
+fn parse_semester_list(v: &Value) -> Vec<String> {
+    let mut list: Vec<String> = find_array(v, &["resultList", "object"])
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| match s.as_str() {
+            Some(id) => id.trim().to_string(),
+            None => pick(s, &["xnxq", "id"]),
+        })
+        .filter(|s| is_semester_id(s))
+        .collect();
+    list.sort_by(|a, b| b.cmp(a));
+    list.dedup();
+    list
+}
+
+/// `YYYY-YYYY-N`, the form Learn uses for semester IDs.
+fn is_semester_id(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('-').collect();
+    matches!(parts.as_slice(), [a, b, t]
+        if a.len() == 4 && b.len() == 4 && t.len() == 1
+            && [a, b, t].iter().all(|p| p.bytes().all(|c| c.is_ascii_digit())))
+}
+
 fn find_array<'a>(v: &'a Value, keys: &[&str]) -> Option<Vec<&'a Value>> {
     // Some Learn endpoints return the array as the response root.
     if let Value::Array(a) = v {
@@ -777,6 +822,22 @@ fn parse_deadline(raw: &str) -> Option<chrono::DateTime<chrono::Local>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn semester_list_skips_nulls_and_sorts_newest_first() {
+        let v = serde_json::json!([
+            "2024-2025-2",
+            null,
+            "2025-2026-1",
+            "2024-2025-2",
+            "junk",
+            ""
+        ]);
+        assert_eq!(parse_semester_list(&v), ["2025-2026-1", "2024-2025-2"]);
+        let wrapped = serde_json::json!({"resultList": [{"xnxq": "2023-2024-3"}]});
+        assert_eq!(parse_semester_list(&wrapped), ["2023-2024-3"]);
+        assert!(parse_semester_list(&serde_json::json!({"result": "x"})).is_empty());
+    }
 
     #[test]
     fn parse_deadline_ms_timestamp() {
