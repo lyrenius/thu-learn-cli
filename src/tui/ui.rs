@@ -834,7 +834,9 @@ fn draw_detail(f: &mut Frame, app: &mut App, area: Rect) {
     if app.zoomed {
         b = b.border_style(Style::new().fg(ACCENT));
     }
-    let inner = b.inner(area).inner(Margin::new(1, 0));
+    // A blank row below the top border and above the bottom one; the text
+    // lines up with the title on the border.
+    let inner = b.inner(area).inner(Margin::new(1, 1));
     // Sections wrap their bodies to this width themselves to keep them indented.
     let width = inner.width as usize;
     let lines = match app.tab {
