@@ -34,7 +34,7 @@ thu-learn            # in a terminal; same as `thu-learn tui`
 thu-learn tui -d ~/Downloads
 ```
 
-The screen shows a list on the left and details for the selected item on the right (stacked on narrow terminals). The TUI reuses the session saved by `thu-learn login`; if there is none, it asks you to run that command and press `r`.
+The screen shows a list on the left and details for the selected item on the right (stacked on narrow terminals). The TUI reuses the session saved by `thu-learn login` and, like the CLI, renews it automatically when it expires. If there is no usable session (or automatic re-login fails), it asks you to run `thu-learn login` and press `r`.
 
 | Key | Action |
 | --- | --- |

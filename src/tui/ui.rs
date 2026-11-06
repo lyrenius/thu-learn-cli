@@ -1384,10 +1384,10 @@ mod tests {
     #[test]
     fn logged_out_screen_explains_login() {
         let mut app = App::new(".".into(), local_dt(2026, 6, 1, 12, 0));
-        app.session = Session::LoggedOut("No saved login session was found.".into());
+        app.session = Session::LoggedOut("No credentials are saved.".into());
         let screen = render(&mut app, 100, 24);
         assert!(screen.contains("Not logged in"));
-        assert!(screen.contains("No saved login session was found."));
+        assert!(screen.contains("No credentials are saved."));
         assert!(screen.contains("thu-learn login"));
     }
 

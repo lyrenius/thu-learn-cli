@@ -1,5 +1,6 @@
 //! Interactive terminal UI for humans. Scripts and agents use the CLI subcommands.
-//! Login stays in `thu-learn login`; the TUI only reuses the saved session.
+//! Login stays in `thu-learn login`; the TUI reuses the saved session, which
+//! [`Client`] renews silently when credentials are saved.
 //!
 //! The event loop draws [`app::App`], feeds it key presses, timer ticks, and
 //! background results, and runs the [`app::Effect`]s it returns as tokio tasks.
@@ -21,7 +22,7 @@ use crossterm::event::{
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
-use crate::client::Client;
+use crate::client::{AuthError, Client};
 use crate::models::{Course, CourseFile, HomeworkAttachment};
 use crate::paths;
 use app::{App, CourseData, Effect, HomeworkDetail, Msg};
@@ -260,17 +261,26 @@ impl Runtime {
 }
 
 async fn check_session() -> Result<Client, String> {
-    let path = paths::cookie_path();
-    if !path.exists() {
-        return Err("No saved login session was found.".into());
-    }
-    let client = Client::new(path).map_err(err_text)?;
+    // Like the CLI, a missing or expired session is renewed with saved credentials,
+    // so a missing cookie file is not an error by itself.
+    let client = Client::new(paths::cookie_path()).map_err(err_text)?;
     match client.confirm_session().await {
         Ok(()) => Ok(client),
-        Err(e) => Err(format!(
-            "The saved session could not be verified ({}).",
-            err_text(e)
-        )),
+        Err(e) => Err(session_failure(&e)),
+    }
+}
+
+/// Explains a failed session check. The session screen already says to run
+/// `thu-learn login` and press `r`, so authentication errors leave that out.
+fn session_failure(e: &anyhow::Error) -> String {
+    match e.downcast_ref::<AuthError>() {
+        Some(AuthError::SessionExpired) => {
+            "Not logged in, or the session expired and no credentials are saved.".into()
+        }
+        Some(AuthError::ReloginFailed(reason)) => {
+            format!("The session expired and automatic re-login failed: {reason}.")
+        }
+        None => format!("The saved session could not be verified ({e:#})."),
     }
 }
 
@@ -497,5 +507,26 @@ mod tests {
         assert_eq!(super::base64(b"fo"), "Zm8=");
         assert_eq!(super::base64(b"foobar"), "Zm9vYmFy");
         assert_eq!(super::base64("作业".as_bytes()), "5L2c5Lia");
+    }
+
+    #[test]
+    fn session_failure_leaves_login_advice_to_the_screen() {
+        use super::{session_failure, AuthError};
+
+        let expired = session_failure(&AuthError::SessionExpired.into());
+        assert!(expired.contains("no credentials are saved"));
+        assert!(!expired.contains("thu-learn login"));
+
+        let relogin = session_failure(&AuthError::ReloginFailed("timed out".into()).into());
+        assert_eq!(
+            relogin,
+            "The session expired and automatic re-login failed: timed out."
+        );
+
+        let network = session_failure(&anyhow::anyhow!("connection refused"));
+        assert_eq!(
+            network,
+            "The saved session could not be verified (connection refused)."
+        );
     }
 }

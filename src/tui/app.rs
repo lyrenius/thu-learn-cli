@@ -5,7 +5,8 @@
 //! I/O out of this module makes the interaction logic testable without Learn.
 //! The only I/O here is local directory listing for the submission file picker.
 //!
-//! Logging in is not the TUI's job: without a session it asks the user to run
+//! Logging in is not the TUI's job: `Client` renews expired sessions with saved
+//! credentials, and without a usable session the TUI asks the user to run
 //! `thu-learn login` and retry.
 
 use std::collections::HashMap;
@@ -611,9 +612,8 @@ impl App {
                         self.homework.loading = false;
                         self.announcements.loading = false;
                         self.files.loading = false;
-                        self.error(format!(
-                            "Could not load courses: {e} (if the session expired, run `thu-learn login`, then press r)"
-                        ));
+                        // Authentication errors already say when to run `thu-learn login`.
+                        self.error(format!("Could not load courses: {e} (press r to retry)"));
                     }
                 }
             }
