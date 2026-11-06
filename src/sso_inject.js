@@ -1,4 +1,4 @@
-// Injected by thu-learn-cli into the Tsinghua login page before page scripts run
+// Injected by thu-learn-cli into the THU login page before page scripts run
 // (CDP Page.addScriptToEvaluateOnNewDocument, see src/browser_login.rs).
 //
 // It mirrors learnX's src/helpers/sso.js:

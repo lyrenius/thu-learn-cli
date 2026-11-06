@@ -767,8 +767,18 @@ fn draw_detail(f: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
+/// Label column of detail fields: the longest label ("Submitted") plus a two-cell gap.
+const FIELD_WIDTH: usize = 11;
+
+/// Pads `label` to `width` terminal cells, always leaving at least two spaces
+/// so a long label never runs into the value after it.
+fn pad_label(label: &str, width: usize) -> String {
+    let gap = width.saturating_sub(UnicodeWidthStr::width(label)).max(2);
+    format!("{label}{}", " ".repeat(gap))
+}
+
 fn field(label: &str, value: Vec<Span<'static>>) -> Line<'static> {
-    let mut spans = vec![Span::styled(format!("{label:<10}"), muted())];
+    let mut spans = vec![Span::styled(pad_label(label, FIELD_WIDTH), muted())];
     spans.extend(value);
     Line::from(spans)
 }
@@ -866,9 +876,20 @@ fn homework_detail(app: &App, h: &Homework) -> Vec<Line<'static>> {
                 lines.push(Line::styled("No attachments.", muted()));
             } else {
                 lines.push(heading("Attachments"));
+                // Align file names after the widest section label in this list.
+                let width = d
+                    .attachments
+                    .iter()
+                    .map(|a| UnicodeWidthStr::width(attachment_section(&a.section)))
+                    .max()
+                    .unwrap_or(0)
+                    + 2;
                 for a in &d.attachments {
                     lines.push(Line::from(vec![
-                        Span::styled(format!("  {:<10}", attachment_section(&a.section)), muted()),
+                        Span::styled(
+                            format!("  {}", pad_label(attachment_section(&a.section), width)),
+                            muted(),
+                        ),
                         Span::raw(clean(&a.filename)),
                     ]));
                 }
@@ -1379,6 +1400,55 @@ mod tests {
         let screen = render(&mut app, 80, 30);
         assert!(screen.contains("Socket report"));
         assert!(screen.contains("Details"));
+    }
+
+    #[test]
+    fn detail_labels_keep_a_gap_before_values() {
+        assert_eq!(pad_label("Status", FIELD_WIDTH), "Status     ");
+        assert_eq!(pad_label("Submitted", FIELD_WIDTH), "Submitted  ");
+        assert_eq!(pad_label("Longer than width", 10), "Longer than width  ");
+        assert_eq!(pad_label("作业附件", 10), "作业附件  ");
+
+        let mut app = ready_app();
+        let attachment = |section: &str, filename: &str| crate::models::HomeworkAttachment {
+            section: section.into(),
+            filename: filename.into(),
+            download_path: "https://learn.tsinghua.edu.cn/x".into(),
+        };
+        app.details.insert(
+            "soon".into(),
+            DetailState::Loaded(crate::tui::app::HomeworkDetail {
+                description: String::new(),
+                // "Attachment" is the parser's fallback when no Learn section label precedes a file.
+                attachments: vec![
+                    attachment("作业附件", "spec.pdf"),
+                    attachment("Attachment", "L8 slides.pptx"),
+                ],
+            }),
+        );
+        let h = app
+            .homework
+            .data
+            .iter()
+            .find(|h| h.student_homework_id == "soon")
+            .unwrap()
+            .clone();
+        let text: Vec<String> = homework_detail(&app, &h)
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
+        assert!(
+            text.contains(&"Status     Pending".to_string()),
+            "{text:#?}"
+        );
+        assert!(
+            text.contains(&"  Homework    spec.pdf".to_string()),
+            "{text:#?}"
+        );
+        assert!(
+            text.contains(&"  Attachment  L8 slides.pptx".to_string()),
+            "{text:#?}"
+        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! Tsinghua unified authentication (`id.tsinghua.edu.cn`) helpers for silent re-login.
+//! THU unified authentication (`id.tsinghua.edu.cn`) helpers for silent re-login.
 //!
 //! This mirrors learnX, which keeps students signed in by storing the account
 //! password plus a random device fingerprint, and logging in again over plain
@@ -19,7 +19,7 @@ use anyhow::{anyhow, Context, Result};
 use scraper::{Html, Selector};
 use sm2::pke::EncryptingKey;
 
-/// Learn's application ID in Tsinghua unified authentication.
+/// Learn's application ID in THU unified authentication.
 pub const LEARN_APP_ID: &str = "bb5df85216504820be7bba2b0ae1535b";
 
 /// Why an HTTP login against `id.tsinghua.edu.cn` did not yield a Learn ticket.
@@ -39,26 +39,23 @@ impl std::fmt::Display for SsoFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SsoFailure::NoPublicKey => {
-                write!(
-                    f,
-                    "the Tsinghua login form did not include an SM2 public key"
-                )
+                write!(f, "the THU login form did not include an SM2 public key")
             }
             SsoFailure::NeedsTwoFactor => write!(
                 f,
-                "Tsinghua asked for two-factor authentication, so this device is not \
+                "THU asked for two-factor authentication, so this device is not \
                  (or no longer) trusted"
             ),
             SsoFailure::Rejected(Some(msg)) => {
-                write!(f, "Tsinghua rejected the saved credentials: {msg}")
+                write!(f, "THU rejected the saved credentials: {msg}")
             }
             SsoFailure::Rejected(None) => write!(
                 f,
-                "Tsinghua rejected the saved credentials (wrong password, or a captcha is required)"
+                "THU rejected the saved credentials (wrong password, or a captcha is required)"
             ),
             SsoFailure::NoTicket => write!(
                 f,
-                "Tsinghua did not return a Learn ticket; the login page may have changed"
+                "THU did not return a Learn ticket; the login page may have changed"
             ),
         }
     }
@@ -75,7 +72,7 @@ pub fn generate_fingerprint() -> Result<String> {
     Ok(to_hex(&bytes))
 }
 
-/// Device name shown in the Tsinghua trusted-device list, like learnX's `<model>,learnX/<version>`.
+/// Device name shown in the THU trusted-device list, like learnX's `<model>,learnX/<version>`.
 pub fn device_name() -> String {
     let os = match std::env::consts::OS {
         "macos" => "macOS",

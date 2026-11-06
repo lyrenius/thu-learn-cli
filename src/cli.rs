@@ -429,7 +429,7 @@ fn detail_section(title: &str, body: &str) -> String {
 #[command(
     name = "thu-learn",
     version,
-    about = "Tsinghua Web Learning command-line client for homework deadlines, files, announcements, and submissions",
+    about = "THU Web Learning command-line client for homework deadlines, files, announcements, and submissions",
     after_help = "Run `thu-learn` without a command in a terminal to open the interactive TUI."
 )]
 pub struct Cli {
@@ -451,19 +451,19 @@ enum Commands {
     },
     /// Log in once and stay logged in: expired sessions are renewed automatically.
     ///
-    /// Asks for your Tsinghua username and password, then opens Chrome for captcha
+    /// Asks for your THU username and password, then opens Chrome for captcha
     /// and two-factor checks. Like learnX, the CLI trusts a random device ID during
     /// two-factor authentication and saves the password and that ID in the system
     /// credential store, so later sessions can be renewed without a browser.
     Login {
-        /// Tsinghua username or student ID; asked interactively when omitted.
+        /// THU username or student ID; asked interactively when omitted.
         #[arg(short, long)]
         username: Option<String>,
         /// Only keep this browser session; do not save (and forget any saved) credentials.
         #[arg(long)]
         no_remember: bool,
         /// Log in through Chrome even if this device is already trusted (for example when
-        /// Tsinghua asks for a captcha).
+        /// THU asks for a captcha).
         #[arg(long, conflicts_with = "no_remember")]
         browser: bool,
     },
@@ -643,7 +643,7 @@ async fn cmd_login(username: Option<String>, force_browser: bool) -> Result<()> 
         None => prompt_username(saved.as_ref().map(|c| c.username.as_str()))?,
     };
     if username.is_empty() {
-        anyhow::bail!("A Tsinghua username is required.");
+        anyhow::bail!("A THU username is required.");
     }
     let password = rpassword::prompt_password("Password: ")
         .context("Failed to read the password (`thu-learn login` needs an interactive terminal)")?;
@@ -735,7 +735,7 @@ async fn cmd_logout() -> Result<()> {
         println!("Logged out. Removed session cookies and cache.");
     }
     println!(
-        "   Tsinghua may still list this device as trusted; you can remove it from your account's trusted devices."
+        "   THU may still list this device as trusted; you can remove it from your account's trusted devices."
     );
     Ok(())
 }
@@ -744,8 +744,8 @@ async fn cmd_logout() -> Result<()> {
 fn prompt_username(default: Option<&str>) -> Result<String> {
     use std::io::Write;
     match default {
-        Some(d) => eprint!("Tsinghua username [{d}]: "),
-        None => eprint!("Tsinghua username: "),
+        Some(d) => eprint!("THU Username [{d}]: "),
+        None => eprint!("THU Username: "),
     }
     std::io::stderr().flush().ok();
     let mut line = String::new();
@@ -1310,7 +1310,7 @@ mod tests {
         Cli::command().write_long_help(&mut help).unwrap();
         let help = String::from_utf8(help).unwrap();
 
-        assert!(help.contains("Tsinghua Web Learning command-line client"));
+        assert!(help.contains("THU Web Learning command-line client"));
         assert!(!help.contains("completion"));
         assert!(!help.contains("清华"));
         assert!(!help.contains("作业"));

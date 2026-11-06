@@ -1,4 +1,4 @@
-//! Data models for Tsinghua Learn.
+//! Data models for THU Learn.
 //!
 //! Learn API JSON fields use pinyin abbreviations. Parsing stays in
 //! [`crate::api`] with `serde_json::Value`; this module exposes clean models.

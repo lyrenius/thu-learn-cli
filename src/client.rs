@@ -1,4 +1,4 @@
-//! Tsinghua Learn HTTP client: session reuse, CSRF handling, and silent re-login.
+//! THU Learn HTTP client: session reuse, CSRF handling, and silent re-login.
 //!
 //! Learn sessions live on the server and expire after a period of inactivity,
 //! so saved cookies alone keep a login alive only briefly. Like learnX (through
@@ -120,7 +120,7 @@ enum CredentialSource {
 struct ReloginFailure {
     reason: String,
     at: Instant,
-    /// Tsinghua rejected these credentials; never retry them automatically
+    /// THU rejected these credentials; never retry them automatically
     /// (repeated failed logins can trigger a captcha or lock the account).
     definitive: bool,
     /// Which credentials failed, so a different credential set is tried again.
@@ -138,7 +138,7 @@ pub struct Client {
     http: HttpClient,
     cookie_store: Arc<CookieStoreMutex>,
     cookie_path: PathBuf,
-    /// Marker file recording credentials that Tsinghua rejected, shared by all processes.
+    /// Marker file recording credentials that THU rejected, shared by all processes.
     block_path: PathBuf,
     endpoints: Endpoints,
     session: tokio::sync::Mutex<Session>,
@@ -285,7 +285,7 @@ impl Client {
             .send()
             .await
             .map_err(reqwest::Error::without_url)
-            .context("Failed to reach Tsinghua Learn")?
+            .context("Failed to reach THU Learn")?
             .text()
             .await
             .map_err(reqwest::Error::without_url)?;
@@ -334,7 +334,7 @@ impl Client {
         };
         let digest = credentials_digest(&creds);
 
-        // Credentials Tsinghua already rejected (here or in another process) are not retried.
+        // Credentials THU already rejected (here or in another process) are not retried.
         let known_rejection = match &session.failure {
             Some(f) if f.definitive && f.digest == digest => Some(f.reason.clone()),
             _ => self.blocked_reason(&digest),
@@ -411,7 +411,7 @@ impl Client {
         match tokio::time::timeout(self.login_timeout, self.sso_login(creds)).await {
             Ok(result) => result,
             Err(_) => bail!(
-                "logging in to Tsinghua took longer than {} seconds",
+                "logging in to THU took longer than {} seconds",
                 self.login_timeout.as_secs()
             ),
         }
@@ -430,10 +430,10 @@ impl Client {
             .send()
             .await
             .map_err(reqwest::Error::without_url)
-            .context("Failed to open the Tsinghua login page")?
+            .context("Failed to open the THU login page")?
             .error_for_status()
             .map_err(reqwest::Error::without_url)
-            .context("The Tsinghua login page returned an error")?;
+            .context("The THU login page returned an error")?;
         if Endpoints::same_origin(&self.endpoints.learn, form_page.url()) {
             // Already signed in to ID: the form redirected straight back to Learn.
             if let Some(token) = self.fetch_csrf().await? {
@@ -462,7 +462,7 @@ impl Client {
             .send()
             .await
             .map_err(reqwest::Error::without_url)
-            .context("Failed to submit the Tsinghua login form")?;
+            .context("Failed to submit the THU login form")?;
         let landed_on_learn = Endpoints::same_origin(&self.endpoints.learn, check.url());
         let check_url = check.url().to_string();
         let check_html = check.text().await.map_err(reqwest::Error::without_url)?;
@@ -664,7 +664,7 @@ impl Client {
     }
 }
 
-/// Failures that mean Tsinghua looked at the credentials and said no.
+/// Failures that mean THU looked at the credentials and said no.
 pub(crate) fn is_definitive_rejection(e: &anyhow::Error) -> bool {
     matches!(
         e.downcast_ref::<SsoFailure>(),

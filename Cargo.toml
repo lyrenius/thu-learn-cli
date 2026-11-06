@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["lyreqwq"]
 license = "GPL-3.0-or-later"
-description = "Command-line client for Tsinghua Learn: homework deadlines, course files, announcements, and submissions"
+description = "Command-line client for THU Learn: homework deadlines, course files, announcements, and submissions"
 repository = "https://github.com/lyreqwq/thu-learn-cli"
 
 [[bin]]

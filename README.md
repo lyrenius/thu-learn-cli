@@ -1,6 +1,6 @@
 # thu-learn-cli
 
-`thu-learn-cli` is a Rust client for Tsinghua University's Web Learning (<https://learn.tsinghua.edu.cn>). It helps students inspect homework deadlines, read announcements, download course files, and submit homework from a terminal.
+`thu-learn-cli` is a Rust client for THU's Web Learning (<https://learn.tsinghua.edu.cn>). It helps students inspect homework deadlines, read announcements, download course files, and submit homework from a terminal.
 
 It has two front ends over the same Learn client:
 
@@ -10,7 +10,7 @@ It has two front ends over the same Learn client:
 ## Features
 
 * Interactive TUI with homework, announcement, file, and course tabs, live search, course filters, downloads, and submission.
-* Browser-based login through the official Tsinghua authentication flow.
+* Browser-based login through the official THU authentication flow.
 * Stays logged in: like learnX, an expired Learn session is renewed automatically in the background.
 * Homework listing, detail view, attachment download, and submission.
 * Course announcement listing and detail view.
@@ -91,7 +91,7 @@ Run:
 thu-learn login
 ```
 
-The command asks for your Tsinghua username and password, then opens a Google Chrome window on Tsinghua's normal login page with both fields filled in. Complete any captcha and two-factor check there. When Tsinghua asks whether to trust the device, the CLI answers "yes" for its own random device ID. After the Learn home page is reached, the CLI checks that it can log in again over plain HTTP, and only then saves the credentials.
+The command asks for your THU username and password, then opens a Google Chrome window on THU's normal login page with both fields filled in. Complete any captcha and two-factor check there. When THU asks whether to trust the device, the CLI answers "yes" for its own random device ID. After the Learn home page is reached, the CLI checks that it can log in again over plain HTTP, and only then saves the credentials.
 
 ### Why you stay logged in
 
@@ -101,15 +101,15 @@ Learn sessions live on the server and expire after a period of inactivity, so sa
 2. The username, password, and that device ID are saved in the system credential store.
 3. When a request finds the session expired (Learn redirects to `login_timeout` or answers HTTP 403), the CLI logs in to `id.tsinghua.edu.cn` again over HTTP. The password is SM2-encrypted exactly like the official login form does it. The CLI then opens Learn with the returned ticket and retries the request. Because the device ID is trusted, no two-factor prompt is needed.
 
-You only need to run `thu-learn login` again if your password changes, or if Tsinghua stops trusting the device (for example, after you remove it from your account). The next `thu-learn login` reuses the saved device ID, so it usually succeeds without opening Chrome; use `thu-learn login --browser` to go through Chrome anyway, for example when Tsinghua asks for a captcha.
+You only need to run `thu-learn login` again if your password changes, or if THU stops trusting the device (for example, after you remove it from your account). The next `thu-learn login` reuses the saved device ID, so it usually succeeds without opening Chrome; use `thu-learn login --browser` to go through Chrome anyway, for example when THU asks for a captcha.
 
-Failed logins are not repeated blindly, because repeated failures can make Tsinghua require a captcha. A network problem is retried after 30 seconds. Credentials that Tsinghua rejects (wrong password, or the device is no longer trusted) are not tried again, not even by later commands, until the next successful `thu-learn login`. This is recorded in `~/.config/thu-learn-cli/relogin-blocked.json`, which holds only a hash of the rejected credentials.
+Failed logins are not repeated blindly, because repeated failures can make THU require a captcha. A network problem is retried after 30 seconds. Credentials that THU rejects (wrong password, or the device is no longer trusted) are not tried again, not even by later commands, until the next successful `thu-learn login`. This is recorded in `~/.config/thu-learn-cli/relogin-blocked.json`, which holds only a hash of the rejected credentials.
 
 ### Storage and options
 
 * Credentials are stored in the macOS Keychain, Windows Credential Manager, or the Secret Service keyring on Linux. Only if no such store exists (for example, a headless Linux machine) do they go to `~/.config/thu-learn-cli/credentials.json`, which only your user can read. A locked keyring, or a denied access prompt, is reported as an error instead. Set `THU_LEARN_CREDENTIAL_STORE=file` to always use the file, or `keyring` to require the system store.
 * `thu-learn login --no-remember` keeps the old behavior: only browser cookies are saved, no password is stored, and any previously saved credentials are removed.
-* `thu-learn logout` ends the Learn session and deletes saved credentials (from the keyring and the fallback file), cookies, and cache. If any copy cannot be removed, it says so and exits with an error. Tsinghua may keep listing the device as trusted until you remove it from your account.
+* `thu-learn logout` ends the Learn session and deletes saved credentials (from the keyring and the fallback file), cookies, and cache. If any copy cannot be removed, it says so and exits with an error. THU may keep listing the device as trusted until you remove it from your account.
 
 Requirements and storage behavior:
 
@@ -189,7 +189,7 @@ The hidden `thu-learn debug` command prints selected raw Learn API responses for
 
 ## Data Safety
 
-`~/.config/thu-learn-cli/cookies.json` contains session credentials, and the `thu-learn-cli` entry in the system credential store (or the fallback `~/.config/thu-learn-cli/credentials.json`) contains your Tsinghua password and trusted device ID. Do not print them, copy them into a repository, commit them, or share them. Rebuildable cache data is stored under `~/.cache/thu-learn-cli/`. Automated tests should not require a live Web Learning account, Chrome, chromedriver, the system credential store, or an existing cookie file.
+`~/.config/thu-learn-cli/cookies.json` contains session credentials, and the `thu-learn-cli` entry in the system credential store (or the fallback `~/.config/thu-learn-cli/credentials.json`) contains your THU password and trusted device ID. Do not print them, copy them into a repository, commit them, or share them. Rebuildable cache data is stored under `~/.cache/thu-learn-cli/`. Automated tests should not require a live Web Learning account, Chrome, chromedriver, the system credential store, or an existing cookie file.
 
 ## Acknowledgements
 
@@ -202,4 +202,4 @@ The hidden `thu-learn debug` command prints selected raw Learn API responses for
 
 This project is licensed under [GPL-3.0-or-later](LICENSE).
 
-Use this tool only with your own Tsinghua account and follow the Learn platform terms of service. Do not use it for bulk scraping or abuse.
+Use this tool only with your own THU account and follow the Learn platform terms of service. Do not use it for bulk scraping or abuse.

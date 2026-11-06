@@ -54,13 +54,13 @@ return out;
 /// Captured cookie tuple: name, value, domain, and path.
 pub type RawCookie = (String, String, String, String);
 
-/// Credentials and device identity to inject into the Tsinghua login page.
+/// Credentials and device identity to inject into the THU login page.
 pub struct SsoInjection {
     pub username: String,
     pub password: String,
     /// Random device fingerprint submitted as `fingerPrint` and trusted during two-factor authentication.
     pub fingerprint: String,
-    /// Name shown in the Tsinghua trusted-device list.
+    /// Name shown in the THU trusted-device list.
     pub device_name: String,
 }
 
@@ -147,7 +147,7 @@ pub fn stdin_enter_signal() -> mpsc::Receiver<()> {
     rx
 }
 
-/// Opens Chrome on the Tsinghua login page and waits until Learn is reached.
+/// Opens Chrome on the THU login page and waits until Learn is reached.
 ///
 /// With `injection`, the ID login page is opened directly and patched as described
 /// in the module docs. `manual_continue` lets the user finish waiting early, and
@@ -188,7 +188,7 @@ async fn drive(
                     serde_json::json!({ "source": injection_script(injection, &key) }),
                 )
                 .await
-                .context("Failed to prepare the Tsinghua login page in Chrome")?;
+                .context("Failed to prepare the THU login page in Chrome")?;
             storage_key = Some(key);
             crate::client::Endpoints::default().id_login_form()
         }
@@ -198,9 +198,9 @@ async fn drive(
     driver
         .goto(&start_url)
         .await
-        .context("Failed to open the Tsinghua login page")?;
+        .context("Failed to open the THU login page")?;
 
-    progress("A Chrome window is open. Complete Tsinghua authentication there.");
+    progress("A Chrome window is open. Complete THU authentication there.");
     if injection.is_some() {
         progress(
             "Your username and password are filled in. Finish any captcha or two-factor \

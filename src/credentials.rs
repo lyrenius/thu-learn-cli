@@ -1,4 +1,4 @@
-//! Saved Tsinghua credentials for silent re-login.
+//! Saved THU credentials for silent re-login.
 //!
 //! Like learnX (which keeps them in the iOS Keychain / Android Keystore through
 //! expo-secure-store), the CLI stores the username, password, and the trusted
@@ -23,7 +23,7 @@ const STORE_ENV: &str = "THU_LEARN_CREDENTIAL_STORE";
 /// Everything needed to log in to `id.tsinghua.edu.cn` without a browser.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Credentials {
-    /// `i_user`: Tsinghua username or student ID.
+    /// `i_user`: THU username or student ID.
     pub username: String,
     /// Account password, sent SM2-encrypted as `i_pass`.
     pub password: String,

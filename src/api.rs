@@ -1,4 +1,4 @@
-//! High-level Tsinghua Learn API methods built on top of [`Client`].
+//! High-level THU Learn API methods built on top of [`Client`].
 //!
 //! Learn returns pinyin-abbreviated JSON fields that can vary by endpoint and
 //! version. This module keeps parsing defensive with `serde_json::Value` and

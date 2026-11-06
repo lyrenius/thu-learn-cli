@@ -3,7 +3,7 @@
 ## Project Facts
 
 * Single Rust 2021 binary crate named `thu-learn`; `src/main.rs` is the only binary entrypoint and release output is `target/release/thu-learn`.
-* The CLI talks to Tsinghua Learn at `learn.tsinghua.edu.cn`; project-owned docs, comments, help text, and runtime output should be English. Preserve Chinese only for Learn protocol literals and realistic fixtures, and document those cases when they appear.
+* The CLI talks to THU Learn at `learn.tsinghua.edu.cn`; project-owned docs, comments, help text, and runtime output should be English. Preserve Chinese only for Learn protocol literals and realistic fixtures, and document those cases when they appear.
 
 ## Module Boundaries
 
@@ -31,7 +31,7 @@
 * Tests must not touch the real credential store: build clients with `Client::with_endpoints` and inject credentials with `set_credentials`.
 * The cache is under `~/.cache/thu-learn-cli/`; `thu-learn login` clears it after importing cookies.
 * The old `./cookies.json` file and old macOS app support cache are not migrated automatically, so users may need to log in again.
-* Do not make automated tests require live `learn.tsinghua.edu.cn`, a real Tsinghua account, Chrome, chromedriver, or an existing `cookies.json`.
+* Do not make automated tests require live `learn.tsinghua.edu.cn`, a real THU account, Chrome, chromedriver, or an existing `cookies.json`.
 
 ## Learn API Quirks
 

@@ -71,7 +71,7 @@ pub async fn login(
                 ) =>
             {
                 bail!(
-                    "{e:#}. Check the password and run `thu-learn login` again; if Tsinghua asks \
+                    "{e:#}. Check the password and run `thu-learn login` again; if THU asks \
                      for a captcha, run `thu-learn login --browser`."
                 );
             }
@@ -90,7 +90,7 @@ pub async fn login(
     let browser = browser_login::run(Some(&injection), manual_continue(), progress).await?;
     if !browser.reached_learn() {
         bail!(
-            "Login did not complete: {}. If Tsinghua said the password was wrong, run \
+            "Login did not complete: {}. If THU said the password was wrong, run \
              `thu-learn login` again and retype it.",
             browser.end.describe()
         );
@@ -109,7 +109,7 @@ pub async fn login(
             let mut reason = format!("{e:#}");
             if !browser.fingerprint_submitted {
                 reason.push_str(
-                    " (the login form was not seen using the CLI's device ID; the Tsinghua \
+                    " (the login form was not seen using the CLI's device ID; the THU \
                      login page may have changed)",
                 );
             }
