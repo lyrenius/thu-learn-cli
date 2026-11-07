@@ -425,6 +425,75 @@ fn detail_section(title: &str, body: &str) -> String {
     format!("## {title}\n{body}")
 }
 
+// ---------- Next-command hints ----------
+//
+// Human output ends with the command to run next, so features such as
+// `hw <id> -d` can be found without reading `--help`. Hints go to stderr to
+// keep stdout unchanged; `--json` output never includes them.
+
+/// Formats a follow-up command. A `--semester` the user gave is kept, because
+/// short IDs are looked up only among that semester's items.
+fn hint_command(args: &str, semester: Option<&str>) -> String {
+    match semester {
+        Some(s) => format!("thu-learn {args} --semester {s}"),
+        None => format!("thu-learn {args}"),
+    }
+}
+
+fn homework_list_hint(semester: Option<&str>) -> String {
+    format!(
+        "Run `{}` to see a homework item and its attachments.",
+        hint_command("hw <id>", semester)
+    )
+}
+
+/// Hints after one homework item, matching the TUI's `d`/`s` actions.
+/// `downloadable` is false when there are no attachments or they were just
+/// downloaded with `-d`.
+fn homework_detail_hints(id: &str, downloadable: bool, semester: Option<&str>) -> Vec<String> {
+    let mut hints = Vec::new();
+    if downloadable {
+        hints.push(format!(
+            "Download attachments: {}",
+            hint_command(&format!("hw {id} -d <dir>"), semester)
+        ));
+    }
+    hints.push(format!(
+        "Submit a file: {}",
+        hint_command(&format!("submit {id} <file>"), semester)
+    ));
+    hints
+}
+
+fn announcement_list_hint(semester: Option<&str>) -> String {
+    format!(
+        "Run `{}` to read an announcement.",
+        hint_command("ann <id>", semester)
+    )
+}
+
+fn file_list_hint(semester: Option<&str>) -> String {
+    format!(
+        "Run `{}` for details, or `{}` to download a file.",
+        hint_command("f show <id>", semester),
+        hint_command("f get <id>", semester)
+    )
+}
+
+fn file_detail_hint(id: &str, semester: Option<&str>) -> String {
+    format!(
+        "Download: {}",
+        hint_command(&format!("f get {id}"), semester)
+    )
+}
+
+fn course_list_hint(semester: Option<&str>) -> String {
+    format!(
+        "Pass a course ID to `-c` to filter, for example `{}`.",
+        hint_command("hw -c <id>", semester)
+    )
+}
+
 #[derive(Parser)]
 #[command(
     name = "thu-learn",
@@ -473,7 +542,7 @@ enum Commands {
     },
     /// Log out and delete saved credentials, session cookies, and cache.
     Logout,
-    /// List homework, optionally filtered by course, or show one homework item.
+    /// List homework, or show one homework item and download its attachments.
     #[command(visible_alias = "hw")]
     Homework {
         /// Homework short ID, unique short-ID prefix, or full `xszyid`.
@@ -487,8 +556,8 @@ enum Commands {
         /// Show only overdue pending homework.
         #[arg(long)]
         overdue: bool,
-        /// With <id>, download that homework item's attachments to this directory.
-        #[arg(short, long)]
+        /// With <id>, download all of that homework item's attachments into this directory.
+        #[arg(short, long, value_name = "DIR")]
         download: Option<PathBuf>,
     },
     /// List announcements, optionally filtered by course, or show one announcement.
@@ -542,8 +611,8 @@ enum FileCommands {
     Get {
         /// File short ID, unique short-ID prefix, or full ID.
         file_id: String,
-        /// Output path. Defaults to the server-provided file name in the current directory.
-        #[arg(short, long)]
+        /// Output file or directory. Defaults to the server-provided file name in the current directory.
+        #[arg(short, long, value_name = "PATH")]
         out: Option<PathBuf>,
     },
 }
@@ -841,6 +910,7 @@ async fn cmd_homework(
     }
 
     println!("{}", render_homework_table(&hws, now));
+    eprintln!("\n{}", homework_list_hint(semester));
     Ok(())
 }
 
@@ -861,6 +931,7 @@ async fn cmd_courses(semester: Option<&str>, json: bool) -> Result<()> {
         return Ok(());
     }
     println!("{}", render_course_table(&courses));
+    eprintln!("\n{}", course_list_hint(semester));
     Ok(())
 }
 
@@ -949,13 +1020,19 @@ async fn cmd_homework_show(
         }
     }
 
-    if let Some(dir) = download {
-        if atts.is_empty() {
-            println!("\nNo attachments to download.");
-            return Ok(());
+    match &download {
+        Some(_) if atts.is_empty() => println!("\nNo attachments to download."),
+        Some(dir) => {
+            println!();
+            download_attachments(&client, &atts, dir).await;
         }
-        println!();
-        download_attachments(&client, &atts, &dir).await;
+        None => {}
+    }
+
+    let downloadable = !atts.is_empty() && download.is_none();
+    eprintln!();
+    for hint in homework_detail_hints(&short_id(&hw.student_homework_id), downloadable, semester) {
+        eprintln!("{hint}");
     }
     Ok(())
 }
@@ -1008,7 +1085,7 @@ async fn cmd_announcement(
         return Ok(());
     }
     println!("{}", render_announcement_table(&notes));
-    eprintln!("\nRun `thu-learn ann <id>` to read an announcement.");
+    eprintln!("\n{}", announcement_list_hint(semester));
     Ok(())
 }
 
@@ -1077,6 +1154,9 @@ async fn cmd_file_ls(semester: Option<&str>, filter: Option<String>, json: bool)
             Err(e) => eprintln!("  (failed to fetch files for {}: {e})", course.name),
         }
     }
+    if !all_files.is_empty() {
+        eprintln!("\n{}", file_list_hint(semester));
+    }
     Ok(())
 }
 
@@ -1120,7 +1200,8 @@ async fn cmd_file_show(semester: Option<&str>, id: String, json: bool) -> Result
     if !f.description.is_empty() {
         println!("\n{}", detail_section("Description", &f.description));
     }
-    println!("\nDownload: thu-learn f get {}", short_id(&f.id));
+    // This hint predates the others and stays on stdout to keep output stable.
+    println!("\n{}", file_detail_hint(&short_id(&f.id), semester));
     Ok(())
 }
 
@@ -1197,9 +1278,10 @@ async fn cmd_submit(
 #[cfg(test)]
 mod tests {
     use super::{
-        detail_section, filter_courses, render_announcement_table, render_course_file_table,
-        render_course_table, render_homework_table, render_table, resolve_item_by_id, Cli,
-        TableCell,
+        announcement_list_hint, course_list_hint, detail_section, file_detail_hint, file_list_hint,
+        filter_courses, hint_command, homework_detail_hints, homework_list_hint,
+        render_announcement_table, render_course_file_table, render_course_table,
+        render_homework_table, render_table, resolve_item_by_id, Cli, TableCell,
     };
     use crate::models::{short_id, Course, CourseFile, Homework, HomeworkStatus, Notification};
     use chrono::TimeZone;
@@ -1322,6 +1404,102 @@ mod tests {
                 "{bad} should be rejected"
             );
         }
+    }
+
+    /// Every hint, for an item with short ID `abc1234`.
+    fn all_hints(semester: Option<&str>) -> Vec<String> {
+        let mut hints = vec![
+            homework_list_hint(semester),
+            announcement_list_hint(semester),
+            file_list_hint(semester),
+            file_detail_hint("abc1234", semester),
+            course_list_hint(semester),
+        ];
+        hints.extend(homework_detail_hints("abc1234", true, semester));
+        hints
+    }
+
+    /// The `thu-learn ...` commands in a hint: quoted in backticks, or after `Label: `.
+    fn commands_in(hint: &str) -> Vec<String> {
+        let quoted = hint
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|s| s.starts_with("thu-learn "))
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        if !quoted.is_empty() {
+            return quoted;
+        }
+        hint.split_once(": ")
+            .map(|(_, c)| vec![c.to_string()])
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn hints_keep_the_semester_the_user_gave() {
+        assert_eq!(hint_command("ann <id>", None), "thu-learn ann <id>");
+        assert_eq!(
+            hint_command("ann <id>", Some("2025-2026-1")),
+            "thu-learn ann <id> --semester 2025-2026-1"
+        );
+    }
+
+    #[test]
+    fn homework_detail_offers_download_only_when_useful() {
+        assert_eq!(
+            homework_detail_hints("abc1234", true, None),
+            [
+                "Download attachments: thu-learn hw abc1234 -d <dir>",
+                "Submit a file: thu-learn submit abc1234 <file>",
+            ]
+        );
+        assert_eq!(
+            homework_detail_hints("abc1234", false, None),
+            ["Submit a file: thu-learn submit abc1234 <file>"]
+        );
+    }
+
+    #[test]
+    fn every_hint_is_a_command_the_cli_accepts() {
+        use clap::Parser;
+
+        for semester in [None, Some("2025-2026-1")] {
+            for hint in all_hints(semester) {
+                let commands = commands_in(&hint);
+                assert!(!commands.is_empty(), "no command in hint: {hint}");
+                for command in commands {
+                    let filled = command
+                        .replace("<id>", "abc1234")
+                        .replace("<dir>", "out")
+                        .replace("<file>", "hw.pdf");
+                    assert!(!filled.contains('<'), "unfilled placeholder: {command}");
+                    let cli = Cli::try_parse_from(filled.split_whitespace())
+                        .unwrap_or_else(|e| panic!("`{command}` does not parse: {e}"));
+                    assert_eq!(cli.semester.as_deref(), semester, "{command}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn download_options_name_their_values() {
+        let mut cmd = Cli::command();
+        let hw = cmd
+            .find_subcommand_mut("homework")
+            .unwrap()
+            .render_help()
+            .to_string();
+        assert!(hw.contains("--download <DIR>"), "{hw}");
+
+        let get = cmd
+            .find_subcommand_mut("file")
+            .unwrap()
+            .find_subcommand_mut("get")
+            .unwrap()
+            .render_help()
+            .to_string();
+        assert!(get.contains("--out <PATH>"), "{get}");
     }
 
     #[test]

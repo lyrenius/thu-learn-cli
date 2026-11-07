@@ -140,8 +140,8 @@ thu-learn hw
 thu-learn hw -a
 thu-learn hw --overdue
 thu-learn hw -c <course>
-thu-learn hw <id>
-thu-learn hw <id> -d ./dir
+thu-learn hw <id>              # details and attachment names
+thu-learn hw <id> -d ./dir     # also download all of its attachments into ./dir
 
 # Announcements
 thu-learn ann
@@ -167,6 +167,7 @@ thu-learn hw -a --semester 2025-2026-1
 Notes:
 
 * Human output uses color when stdout supports it; `--json` output is plain structured data.
+* Lists and detail views end with the command to run next, such as `thu-learn hw <id> -d <dir>` under a homework item with attachments. These hints go to stderr (except the older `Download:` line of `f show`) and keep any `--semester` you gave, because short IDs are looked up within one semester.
 * Commands use Learn's current semester unless `--semester` names another; `thu-learn --semester <ID>` opens the TUI on that semester.
 * The current semester and course list are cached for six hours.
 * Homework, announcement, and file requests are intentionally concurrent.
