@@ -1,0 +1,22 @@
+# cargo-about configuration for THIRD_PARTY_LICENSES.md, which the release
+# workflow generates with about.hbs and ships in every archive. A dependency
+# under a license missing from `accepted` fails the release until the license
+# is reviewed and added. Earlier entries win for dual-licensed crates.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "ISC",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+    "CDLA-Permissive-2.0",
+]
+# Only the platforms that get release binaries.
+targets = ["aarch64-apple-darwin", "x86_64-unknown-linux-musl"]
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+
+# This crate itself; about.hbs leaves it out of the listing.
+[thu-learn]
+accepted = ["GPL-3.0-or-later"]

@@ -29,6 +29,16 @@ jobs:
           fi
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
+      # Fails when a dependency's license is not accepted in about.toml.
+      - name: Generate third-party licenses
+        run: |
+          cargo install --locked cargo-about@0.9.3 --features cli
+          cargo about generate --locked --fail about.hbs -o THIRD_PARTY_LICENSES.md
+      - uses: actions/upload-artifact@v7
+        with:
+          name: third-party-licenses
+          path: THIRD_PARTY_LICENSES.md
+          if-no-files-found: error
 
   build:
     needs: check
@@ -51,13 +61,16 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo test --locked --target "$TARGET"
       - run: cargo build --release --locked --target "$TARGET"
+      - uses: actions/download-artifact@v8
+        with:
+          name: third-party-licenses
       # Archive names carry no version, so releases/latest/download/<name>
       # in the README always points at the newest release.
       - name: Package
         run: |
           name="thu-learn-$TARGET"
           mkdir "$name"
-          cp "target/$TARGET/release/thu-learn" README.md LICENSE THIRD_PARTY_NOTICES.md "$name/"
+          cp "target/$TARGET/release/thu-learn" README.md LICENSE THIRD_PARTY_NOTICES.md THIRD_PARTY_LICENSES.md "$name/"
           tar -czf "$name.tar.gz" "$name"
           shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
       - uses: actions/upload-artifact@v7

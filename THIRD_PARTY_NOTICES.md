@@ -1,5 +1,7 @@
 # Third-Party Notices
 
+This file covers code ported into this repository. The licenses of the Rust crates compiled into the `thu-learn` binary are listed in `THIRD_PARTY_LICENSES.md`, which every release archive includes; see [Development](README.md#development) to generate it.
+
 ## yazi
 
 The homework submission picker in `src/tui/picker/` follows the default keymap and behavior of [yazi](https://github.com/sxyazi/yazi), and the following parts are ported from its source at commit `b4f0d123952e52c4dafe874178de2b34c82f1ab2`:

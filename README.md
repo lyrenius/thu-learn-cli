@@ -208,7 +208,14 @@ Re-login tests run against a local mock of Learn and `id.tsinghua.edu.cn` (`src/
 
 The hidden `thu-learn debug` command prints selected raw Learn API responses for field investigation. It requires a valid login session.
 
-To release, set `version` in `Cargo.toml`, commit, and push a matching tag such as `v0.1.0`. The release workflow (`.github/workflows/release.yml`) checks formatting and lints, runs the tests on each target, builds the archives, and publishes them as a GitHub release. Running the workflow by hand from the Actions tab builds the archives without publishing anything.
+To release, set `version` in `Cargo.toml`, commit, and push a matching tag such as `v0.1.0`. The release workflow (`.github/workflows/release.yml`) checks formatting and lints, generates `THIRD_PARTY_LICENSES.md`, runs the tests on each target, builds the archives, and publishes them as a GitHub release. Running the workflow by hand from the Actions tab builds the archives without publishing anything.
+
+`THIRD_PARTY_LICENSES.md` lists the license of every crate in the release binaries. It is generated with [cargo-about](https://github.com/EmbarkStudios/cargo-about) from `about.toml` and `about.hbs`, and is not committed. A dependency under a license missing from `accepted` in `about.toml` fails the release until you review the license and add it. To generate the file locally:
+
+```bash
+cargo install --locked cargo-about@0.9.3 --features cli
+cargo about generate --locked --fail about.hbs -o THIRD_PARTY_LICENSES.md
+```
 
 ## Data Safety
 
@@ -220,6 +227,7 @@ To release, set `version` in `Cargo.toml`, commit, and push a matching tag such 
 * Browser-login behavior references [reserves-lib-tsinghua-downloader](https://github.com/libthu/reserves-lib-tsinghua-downloader) (GPL-3.0).
 * Silent re-login behavior (trusted device ID, SM2 password encryption, ticket roaming) references [learnX](https://github.com/robertying/learnX) and its [thu-learn-lib fork](https://github.com/robertying/thu-learn-lib) (MIT).
 * The submission picker follows [yazi](https://github.com/sxyazi/yazi)'s default keymap and behavior, and ports some of its code (MIT, copyright 2023 sxyazi). See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+* Release archives include `THIRD_PARTY_LICENSES.md` with the licenses of the Rust crates compiled into the binary.
 
 ## License
 
