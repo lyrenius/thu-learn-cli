@@ -22,7 +22,7 @@
 
 * Run from the repo root: `cargo test`, `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, then `cargo build --release`.
 * Focused examples: `cargo test api::tests::parse_deadline_invalid`, `cargo test client::tests::csrf_extracted`, `cargo test cli::tests::semester_arg_rejects_malformed_ids`.
-* There is no CI, task runner, rustfmt config, or clippy config in this repo; trust Cargo commands and source tests over assumptions.
+* The only GitHub workflow is `.github/workflows/release.yml`: pushing a `v*` tag that matches `Cargo.toml`'s version runs fmt, clippy, and tests, then publishes `thu-learn-<target>.tar.gz` (plus `.sha256`) for `aarch64-apple-darwin` and `x86_64-unknown-linux-musl`. Nothing runs on ordinary pushes or PRs, and there is no task runner, rustfmt config, or clippy config; trust Cargo commands and source tests over assumptions.
 
 ## Runtime And Data Safety
 

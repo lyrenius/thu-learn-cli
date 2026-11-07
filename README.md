@@ -19,7 +19,17 @@ It has two front ends over the same Learn client:
 
 ## Installation
 
-Build the release binary from the repository root:
+Each [GitHub release](https://github.com/lyrenius/thu-learn-cli/releases) has prebuilt binaries for macOS on Apple Silicon (`aarch64-apple-darwin`) and Linux on x86_64 (`x86_64-unknown-linux-musl`, statically linked, so it runs on any distribution). To install the latest one into `~/.local/bin`:
+
+```bash
+target=aarch64-apple-darwin  # or x86_64-unknown-linux-musl on Linux
+curl -fsSL "https://github.com/lyrenius/thu-learn-cli/releases/latest/download/thu-learn-$target.tar.gz" | tar -xz
+mkdir -p ~/.local/bin && mv "thu-learn-$target/thu-learn" ~/.local/bin/
+```
+
+Each archive has a `.sha256` file next to it for `shasum -a 256 -c`. The macOS binary is not signed: if you download it with a browser instead of `curl`, macOS refuses to run it until you remove the quarantine flag with `xattr -d com.apple.quarantine thu-learn`.
+
+To build from source instead, run this from the repository root:
 
 ```bash
 cargo build --release
@@ -83,7 +93,7 @@ The mouse also follows yazi's defaults: in the middle column a click hovers a fi
 
 Input popups work like yazi's: they open in insert mode, `Esc` switches to a vi-style normal mode, and a second `Esc` closes them. Yanked or cut text goes to the system clipboard, and `p`/`P` paste text yanked, cut, or copied inside the picker (they do not read the system clipboard). After choosing a file, type an optional comment and press `Enter`; the confirmation shows the course, homework, file, and size before anything is sent, and `n` returns to the picker as you left it. Dragging a file into the terminal chooses it.
 
-Differences from yazi, because the picker uploads exactly one file: `Enter` on a folder enters it instead of choosing it, choosing more than one file is refused, and keys that change files, run shell commands, use tabs, or call plugins (fd, rg, fzf, zoxide) show a notice instead, and the mouse is ignored while a popup is open. Folder listings refresh about once a second while the picker is open. The picker opens in the download folder and then remembers the last folder you submitted from.
+Differences from yazi, because the picker uploads exactly one file: `Enter` on a folder enters it instead of choosing it, choosing more than one file is refused, and keys that change files, run shell commands, use tabs, or call plugins (fd, rg, fzf, zoxide) show a notice instead, and the mouse is ignored while a popup is open. Folder listings refresh about once a second while the picker is open. The prebuilt Linux binary cannot read file birth times (a musl limitation), so there `mb` shows no times and `,b` sorts by name. The picker opens in the download folder and then remembers the last folder you submitted from.
 
 Downloads go to the current directory unless `--dir` or `D` says otherwise, and never overwrite an existing file (a ` (1)` suffix is added). Downloading selected files asks first, saves them into one folder per course (for example `Networks/Lab 1.pdf`), and fetches four at a time. Detail panes show each item's short ID so it can be passed to CLI commands.
 
@@ -197,6 +207,8 @@ cargo test sso::tests::sm_crypto_fixture_decrypts_with_c1c3c2_layout
 Re-login tests run against a local mock of Learn and `id.tsinghua.edu.cn` (`src/mock_sso.rs`), so they need no network access or account.
 
 The hidden `thu-learn debug` command prints selected raw Learn API responses for field investigation. It requires a valid login session.
+
+To release, set `version` in `Cargo.toml`, commit, and push a matching tag such as `v0.1.0`. The release workflow (`.github/workflows/release.yml`) checks formatting and lints, runs the tests on each target, builds the archives, and publishes them as a GitHub release. Running the workflow by hand from the Actions tab builds the archives without publishing anything.
 
 ## Data Safety
 
